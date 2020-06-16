@@ -31,13 +31,10 @@ import socket
 import audioop
 import logging
 import threading
-import traceback
 
 from . import rtp
-from .utils import Defaultdict
-from .rtp import SilencePacket
 from .opus import Decoder, BufferedDecoder
-from .errors import DiscordException
+from .errors import DiscordException, ClientException
 
 try:
     import nacl.secret
@@ -57,21 +54,10 @@ __all__ = [
     'SinkExit'
 ]
 
+
 class SinkExit(DiscordException):
-    """A signal type exception (like ``GeneratorExit``) to raise in a Sink's write() method to stop it.
+    """A signal type exception (like ``GeneratorExit``) to raise in a Sink's write() method to stop it."""
 
-    TODO: make better words
-
-    Parameters
-    -----------
-    drain: :class:`bool`
-        ...
-    flush: :class:`bool`
-        ...
-    """
-
-    def __init__(self, *, drain=True, flush=False):
-        self.kwargs = kwargs
 
 class AudioSink:
     def __del__(self):
@@ -87,23 +73,22 @@ class AudioSink:
         pass
 
     def pack_data(self, data, user=None, packet=None):
-        return VoiceData(data, user, packet) # is this even necessary?
+        return VoiceData(data, user, packet)  # is this even necessary?
+
 
 class WaveSink(AudioSink):
     def __init__(self, destination):
         self._file = wave.open(destination, 'wb')
         self._file.setnchannels(Decoder.CHANNELS)
-        self._file.setsampwidth(Decoder.SAMPLE_SIZE//Decoder.CHANNELS)
+        self._file.setsampwidth(Decoder.SAMPLE_SIZE // Decoder.CHANNELS)
         self._file.setframerate(Decoder.SAMPLING_RATE)
 
     def write(self, data):
         self._file.writeframes(data.data)
 
     def cleanup(self):
-        try:
-            self._file.close()
-        except:
-            pass
+        self._file.close()
+
 
 class PCMVolumeTransformerFilter(AudioSink):
     def __init__(self, destination, volume=1.0):
@@ -135,6 +120,7 @@ class PCMVolumeTransformerFilter(AudioSink):
 # something like raising an exception and handling that in the write loop
 # Maybe should rename some of these to Filter instead of Sink
 
+
 class ConditionalFilter(AudioSink):
     def __init__(self, destination, predicate):
         self.destination = destination
@@ -143,6 +129,7 @@ class ConditionalFilter(AudioSink):
     def write(self, data):
         if self.predicate(data):
             self.destination.write(data)
+
 
 class TimedFilter(ConditionalFilter):
     def __init__(self, destination, duration, *, start_on_init=False):
@@ -165,6 +152,7 @@ class TimedFilter(ConditionalFilter):
     def get_time(self):
         return time.time()
 
+
 class UserFilter(ConditionalFilter):
     def __init__(self, destination, user):
         super().__init__(destination, self._predicate)
@@ -172,6 +160,7 @@ class UserFilter(ConditionalFilter):
 
     def _predicate(self, data):
         return data.user == self.user
+
 
 # rename 'data' to 'payload'? or 'opus'? something else?
 class VoiceData:
@@ -181,6 +170,7 @@ class VoiceData:
         self.data = data
         self.user = user
         self.packet = packet
+
 
 class AudioReader(threading.Thread):
     def __init__(self, sink, client, *, after=None):
@@ -280,7 +270,7 @@ class AudioReader(threading.Thread):
         # I *think* this is the correct way to do this
         # Depending on how many leftovers I end up with I may reconsider
 
-        self.decoder.drop_ssrc(ssrc) # flush=True?
+        self.decoder.drop_ssrc(ssrc)  # flush=True?
 
     def _get_user(self, packet):
         _, user_id = self.client._get_ssrc_mapping(ssrc=packet.ssrc)
@@ -293,13 +283,12 @@ class AudioReader(threading.Thread):
             user = self._get_user(packet)
             self.sink.write(VoiceData(data, user, packet))
             # TODO: remove weird error handling in favor of injected functions
-        except SinkExit as e:
+        except SinkExit:
             log.info("Shutting down reader thread %s", self)
             self.stop()
-            self._stop_decoders(**e.kwargs)
-        except:
-            traceback.print_exc()
-            # insert optional error handling here
+            self._stop_decoders()
+        except Exception as exc:
+            log.exception(f"Exception when writing to sink: {exc}")
 
     def _set_sink(self, sink):
         with self._decoder_lock:
@@ -323,7 +312,7 @@ class AudioReader(threading.Thread):
             except socket.error as e:
                 t0 = time.time()
 
-                if e.errno == 10038: # ENOTSOCK
+                if e.errno == 10038:  # ENOTSOCK
                     continue
 
                 log.exception("Socket error in reader thread ")
@@ -359,9 +348,8 @@ class AudioReader(threading.Thread):
                 log.exception("CryptoError decoding packet %s", packet)
                 continue
 
-            except:
-                log.exception("Error unpacking packet")
-                traceback.print_exc()
+            except Exception as exc:
+                log.exception(f"Error unpacking packet: {exc}")
 
             else:
                 if packet.ssrc not in self.client._ssrcs:
@@ -379,22 +367,20 @@ class AudioReader(threading.Thread):
             self._current_error = exc
             self.stop()
         except Exception as exc:
-            traceback.print_exc()
+            log.exception(f"Exception in _do_run(): {exc}")
             self._current_error = exc
             self.stop()
         finally:
             self._stop_decoders()
             try:
                 self.sink.cleanup()
-            except:
-                log.exception("Error during sink cleanup")
-                # Testing only
-                traceback.print_exc()
+            except Exception as exc:
+                log.exception(f"Error during sink cleanup: {exc}")
 
             self._call_after()
 
     def _call_after(self):
-         if self.after is not None:
+        if self.after is not None:
             try:
                 self.after(self._current_error)
             except Exception:

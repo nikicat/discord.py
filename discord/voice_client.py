@@ -47,7 +47,7 @@ import threading
 
 from . import opus
 from .backoff import ExponentialBackoff
-from .gateway import *
+from .gateway import DiscordVoiceWebSocket
 from .errors import ClientException, ConnectionClosed
 from .player import AudioPlayer, AudioSource
 from .reader import AudioReader, AudioSink
@@ -62,6 +62,7 @@ except ImportError:
 
 
 log = logging.getLogger(__name__)
+
 
 class VoiceClient:
     """Represents a Discord voice connection.
@@ -190,7 +191,7 @@ class VoiceClient:
         endpoint = data.get('endpoint')
 
         if endpoint is None or self.token is None:
-            log.warning('Awaiting endpoint... This requires waiting. ' \
+            log.warning('Awaiting endpoint... This requires waiting. '
                         'If timeout occurred considering raising the timeout and reconnecting.')
             return
 
@@ -452,7 +453,7 @@ class VoiceClient:
             The audio source we're reading from.
         after: Callable[[:class:`Exception`], Any]
             The finalizer that is called after the stream is exhausted.
-            This function must have a single parameter, ``error``, that 
+            This function must have a single parameter, ``error``, that
             denotes an optional exception that was raised during playing.
 
         Raises
@@ -564,7 +565,7 @@ class VoiceClient:
         if self._reader is None:
             raise ValueError('Not receiving anything.')
 
-        self._reader._set_sink(sink)
+        self._reader._set_sink(value)
 
     def stop(self):
         """Stops playing and receiving audio."""
