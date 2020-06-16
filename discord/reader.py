@@ -24,23 +24,22 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 """
 
+import asyncio
 import time
 import wave
-import select
 import socket
 import audioop
 import logging
-import threading
+from collections import defaultdict
+from dataclasses import dataclass
+
+from nacl.exceptions import CryptoError
 
 from . import rtp
-from .opus import Decoder, BufferedDecoder
+from .opus import Decoder
 from .errors import DiscordException, ClientException
-
-try:
-    import nacl.secret
-    from nacl.exceptions import CryptoError
-except ImportError:
-    pass
+from .member import Member
+from .rtp import RTPPacket
 
 log = logging.getLogger(__name__)
 
@@ -48,9 +47,6 @@ __all__ = [
     'AudioSink',
     'WaveSink',
     'PCMVolumeTransformerFilter',
-    'ConditionalFilter',
-    'TimedFilter',
-    'UserFilter',
     'SinkExit'
 ]
 
@@ -59,21 +55,19 @@ class SinkExit(DiscordException):
     """A signal type exception (like ``GeneratorExit``) to raise in a Sink's write() method to stop it."""
 
 
+@dataclass
+class VoiceData:
+    pcm: bytes
+    user: Member
+    packet: RTPPacket
+
+
 class AudioSink:
-    def __del__(self):
-        self.cleanup()
-
-    def write(self, data):
+    def write(self, data: VoiceData):
         raise NotImplementedError
-
-    def wants_opus(self):
-        return False
 
     def cleanup(self):
         pass
-
-    def pack_data(self, data, user=None, packet=None):
-        return VoiceData(data, user, packet)  # is this even necessary?
 
 
 class WaveSink(AudioSink):
@@ -114,88 +108,14 @@ class PCMVolumeTransformerFilter(AudioSink):
         data = audioop.mul(data.data, 2, min(self._volume, 2.0))
         self.destination.write(data)
 
-# I need some sort of filter sink with a predicate or something
-# Which means I need to sort out the write() signature issue
-# Also need something to indicate a sink is "done", probably
-# something like raising an exception and handling that in the write loop
-# Maybe should rename some of these to Filter instead of Sink
 
-
-class ConditionalFilter(AudioSink):
-    def __init__(self, destination, predicate):
-        self.destination = destination
-        self.predicate = predicate
-
-    def write(self, data):
-        if self.predicate(data):
-            self.destination.write(data)
-
-
-class TimedFilter(ConditionalFilter):
-    def __init__(self, destination, duration, *, start_on_init=False):
-        super().__init__(destination, self._predicate)
-        self.duration = duration
-        if start_on_init:
-            self.start_time = self.get_time()
-        else:
-            self.start_time = None
-            self.write = self._write_once
-
-    def _write_once(self, data):
-        self.start_time = self.get_time()
-        super().write(data)
-        self.write = super().write
-
-    def _predicate(self, data):
-        return self.start_time and self.get_time() - self.start_time < self.duration
-
-    def get_time(self):
-        return time.time()
-
-
-class UserFilter(ConditionalFilter):
-    def __init__(self, destination, user):
-        super().__init__(destination, self._predicate)
-        self.user = user
-
-    def _predicate(self, data):
-        return data.user == self.user
-
-
-# rename 'data' to 'payload'? or 'opus'? something else?
-class VoiceData:
-    __slots__ = ('data', 'user', 'packet')
-
-    def __init__(self, data, user, packet):
-        self.data = data
-        self.user = user
-        self.packet = packet
-
-
-class AudioReader(threading.Thread):
-    def __init__(self, sink, client, *, after=None):
-        super().__init__(daemon=True)
+class AudioReader:
+    def __init__(self, sink, client):
         self.sink = sink
         self.client = client
-        self.after = after
-
-        if after is not None and not callable(after):
-            raise TypeError('Expected a callable for the "after" parameter.')
-
-        self.after = after
-
-        self.box = nacl.secret.SecretBox(bytes(client.secret_key))
+        self.decoders = defaultdict(BufferedAudioDecoder)
         self.decrypt_rtp = getattr(self, '_decrypt_rtp_' + client._mode)
         self.decrypt_rtcp = getattr(self, '_decrypt_rtcp_' + client._mode)
-
-        self._current_error = None
-        self._end = threading.Event()
-        self._decoder_lock = threading.Lock()
-
-        self.decoder = BufferedDecoder(self)
-        self.decoder.start()
-
-        # TODO: inject sink functions
 
     @property
     def connected(self):
@@ -204,7 +124,7 @@ class AudioReader(threading.Thread):
     def _decrypt_rtp_xsalsa20_poly1305(self, packet):
         nonce = bytearray(24)
         nonce[:12] = packet.header
-        result = self.box.decrypt(bytes(packet.data), bytes(nonce))
+        result = self.client.box.decrypt(bytes(packet.data), bytes(nonce))
 
         if packet.extended:
             offset = packet.update_ext_headers(result)
@@ -215,14 +135,14 @@ class AudioReader(threading.Thread):
     def _decrypt_rtcp_xsalsa20_poly1305(self, data):
         nonce = bytearray(24)
         nonce[:8] = data[:8]
-        result = self.box.decrypt(data[8:], bytes(nonce))
+        result = self.client.box.decrypt(data[8:], bytes(nonce))
 
         return data[:8] + result
 
     def _decrypt_rtp_xsalsa20_poly1305_suffix(self, packet):
         nonce = packet.data[-24:]
         voice_data = packet.data[:-24]
-        result = self.box.decrypt(bytes(voice_data), bytes(nonce))
+        result = self.client.box.decrypt(bytes(voice_data), bytes(nonce))
 
         if packet.extended:
             offset = packet.update_ext_headers(result)
@@ -233,7 +153,7 @@ class AudioReader(threading.Thread):
     def _decrypt_rtcp_xsalsa20_poly1305_suffix(self, data):
         nonce = data[-24:]
         header = data[:8]
-        result = self.box.decrypt(data[8:-24], nonce)
+        result = self.client.box.decrypt(data[8:-24], nonce)
 
         return header + result
 
@@ -241,7 +161,7 @@ class AudioReader(threading.Thread):
         nonce = bytearray(24)
         nonce[:4] = packet.data[-4:]
         voice_data = packet.data[:-4]
-        result = self.box.decrypt(bytes(voice_data), bytes(nonce))
+        result = self.client.box.decrypt(bytes(voice_data), bytes(nonce))
 
         if packet.extended:
             offset = packet.update_ext_headers(result)
@@ -253,36 +173,35 @@ class AudioReader(threading.Thread):
         nonce = bytearray(24)
         nonce[:4] = data[-4:]
         header = data[:8]
-        result = self.box.decrypt(data[8:-4], bytes(nonce))
+        result = self.client.box.decrypt(data[8:-4], bytes(nonce))
 
         return header + result
 
-    def _reset_decoders(self, *ssrcs):
-        self.decoder.reset(*ssrcs)
+    def _reset_decoders(self, ssrc=None):
+        log.debug(f"Reseting decoder(s) {ssrc}")
+        if ssrc in self.decoders:
+            del self.decoders[ssrc]
+        else:
+            self.decoders.clear()
 
-    def _stop_decoders(self, **kwargs):
-        self.decoder.stop(**kwargs)
+    def _stop_decoders(self):
+        log.debug("Stopping decoders")
+        self.decoders.clear()
 
     def _ssrc_removed(self, ssrc):
-        # An user has disconnected but there still may be
-        # packets from them left in the buffer to read
-        # For now we're just going to kill the decoder and see how that works out
-        # I *think* this is the correct way to do this
-        # Depending on how many leftovers I end up with I may reconsider
+        log.debug(f"Removed ssrc {ssrc}")
+        if ssrc in self.decoders:
+            del self.decoders[ssrc]
 
-        self.decoder.drop_ssrc(ssrc)  # flush=True?
-
-    def _get_user(self, packet):
-        _, user_id = self.client._get_ssrc_mapping(ssrc=packet.ssrc)
+    def _get_user(self, ssrc):
+        _, user_id = self.client._get_ssrc_mapping(ssrc=ssrc)
         # may need to change this for calls or something
         return self.client.guild.get_member(user_id)
 
-    def _write_to_sink(self, pcm, opus, packet):
+    def feed(self, packet, pcm):
         try:
-            data = opus if self.sink.wants_opus() else pcm
-            user = self._get_user(packet)
-            self.sink.write(VoiceData(data, user, packet))
-            # TODO: remove weird error handling in favor of injected functions
+            user = self._get_user(packet.ssrc)
+            self.sink.write(VoiceData(pcm, user, packet))
         except SinkExit:
             log.info("Shutting down reader thread %s", self)
             self.stop()
@@ -291,100 +210,69 @@ class AudioReader(threading.Thread):
             log.exception(f"Exception when writing to sink: {exc}")
 
     def _set_sink(self, sink):
-        with self._decoder_lock:
-            self.sink = sink
-        # if i were to fire a sink change mini-event it would be here
+        self.sink = sink
 
-    def _do_run(self):
-        while not self._end.is_set():
-            if not self.connected.is_set():
-                self.connected.wait()
+    async def listen_voice(self):
+        async for packet in self.recv():
+            log.debug(f"Received rtcp: {packet}")
+            pcm = self.decoders[packet.ssrc].decode(packet)
+            if pcm:
+                user = self._get_user(packet.ssrc)
+                yield VoiceData(pcm, user, packet)
 
-            ready, _, err = select.select([self.client.socket], [],
-                                          [self.client.socket], 0.01)
-            if not ready:
-                if err:
-                    print("Socket error")
-                continue
-
+    async def recv(self):
+        loop = asyncio.get_running_loop()
+        while True:
             try:
-                raw_data = self.client.socket.recv(4096)
+                raw_data = await loop.sock_recv(self.client.socket, 10000)
             except socket.error as e:
                 t0 = time.time()
 
-                if e.errno == 10038:  # ENOTSOCK
-                    continue
+                log.exception(f"Socket error in reader loop: {e}")
+                await self.client._connecting.wait()
 
-                log.exception("Socket error in reader thread ")
-                print(f"Socket error in reader thread: {e} {t0}")
-
-                with self.client._connecting:
-                    timed_out = self.client._connecting.wait(20)
-
-                if not timed_out:
-                    raise
-                elif self.client.is_connected():
-                    print(f"Reconnected in {time.time()-t0:.4f}s")
+                if self.client.is_connected():
+                    log.debug(f"Reconnected in {time.time()-t0:.4f}s")
                     continue
                 else:
                     raise
-
-            try:
-                packet = None
-                if not rtp.is_rtcp(raw_data):
-                    packet = rtp.decode(raw_data)
-                    packet.decrypted_data = self.decrypt_rtp(packet)
-                else:
-                    packet = rtp.decode(self.decrypt_rtcp(raw_data))
-                    if not isinstance(packet, rtp.ReceiverReportPacket):
-                        print(packet)
-
-                        # TODO: Fabricate and send SenderReports and see what happens
-
-                    self.decoder.feed_rtcp(packet)
-                    continue
-
-            except CryptoError:
-                log.exception("CryptoError decoding packet %s", packet)
-                continue
-
-            except Exception as exc:
-                log.exception(f"Error unpacking packet: {exc}")
-
             else:
-                if packet.ssrc not in self.client._ssrcs:
-                    log.debug("Received packet for unknown ssrc %s", packet.ssrc)
+                try:
+                    if rtp.is_rtcp(raw_data):
+                        packet = rtp.decode(self.decrypt_rtcp(raw_data))
+                        if not isinstance(packet, rtp.ReceiverReportPacket):
+                            log.warning(f"Not a ReceiverReportPacket: {packet}")
+                        # TODO: Fabricate and send SenderReports and see what happens
+                        continue
+                    else:
+                        packet = rtp.decode(raw_data)
+                        packet.decrypted_data = self.decrypt_rtp(packet)
+                except CryptoError:
+                    log.exception("CryptoError decoding packet %s", raw_data)
 
-                self.decoder.feed_rtp(packet)
-
-    def stop(self):
-        self._end.set()
-
-    def run(self):
-        try:
-            self._do_run()
-        except socket.error as exc:
-            self._current_error = exc
-            self.stop()
-        except Exception as exc:
-            log.exception(f"Exception in _do_run(): {exc}")
-            self._current_error = exc
-            self.stop()
-        finally:
-            self._stop_decoders()
-            try:
-                self.sink.cleanup()
-            except Exception as exc:
-                log.exception(f"Error during sink cleanup: {exc}")
-
-            self._call_after()
-
-    def _call_after(self):
-        if self.after is not None:
-            try:
-                self.after(self._current_error)
-            except Exception:
-                log.exception('Calling the after function failed.')
+                except Exception as exc:
+                    log.exception(f"Error unpacking packet: {exc}")
+                else:
+                    yield packet
 
     def is_listening(self):
         return not self._end.is_set()
+
+
+class BufferedAudioDecoder:
+    def __init__(self):
+        self.decoder = Decoder()
+        self.next_seq = 0
+
+    def decode(self, packet: RTPPacket):
+        if packet.sequence == self.next_seq:
+            self.next_seq += 1
+            pcm = self.decoder.decode(packet.decrypted_data)
+        elif packet.sequence > self.next_seq:
+            self.next_seq = packet.sequence + 1
+            pcm = self.decoder.decode(packet.decrypted_data, fec=True)
+            log.debug(f"Received packet with a gap {packet.sequence - self.next_seq}, using FEC")
+        elif packet.sequence < self.next_seq:
+            log.debug(f"Received out-of-order packet {self.next_seq - packet.sequence}, skipping")
+            pcm = None
+        return pcm

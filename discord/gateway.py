@@ -751,6 +751,8 @@ class DiscordVoiceWebSocket(websockets.client.WebSocketClientProtocol):
             self._connection._add_ssrc(int(data['user_id']), data['audio_ssrc'])
         elif op == self.CLIENT_DISCONNECT:
             self._connection._remove_ssrc(user_id=int(data['user_id']))
+        else:
+            log.debug(f"Received unknown WebSocket message: {op} [{data}]")
 
     async def initial_connection(self, data):
         state = self._connection
@@ -785,9 +787,10 @@ class DiscordVoiceWebSocket(websockets.client.WebSocketClientProtocol):
 
     async def load_secret_key(self, data):
         log.info('received secret key for voice connection')
-        self._connection.secret_key = data.get('secret_key')
+        self._connection.set_secret_key(data.get('secret_key'))
 
     async def _do_hacks(self):
+        log.debug("Doing hacks")
         # Everything below this is a hack because discord keeps breaking things
 
         # hack #1

@@ -24,8 +24,6 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 """
 
-import threading
-import traceback
 import subprocess
 import audioop
 import asyncio
@@ -33,7 +31,6 @@ import logging
 import shlex
 import time
 import json
-import sys
 import re
 
 from .errors import ClientException
@@ -50,6 +47,7 @@ __all__ = (
     'FFmpegOpusAudio',
     'PCMVolumeTransformer',
 )
+
 
 class AudioSource:
     """Represents an audio stream.
@@ -97,6 +95,7 @@ class AudioSource:
     def __del__(self):
         self.cleanup()
 
+
 class PCMAudio(AudioSource):
     """Represents raw 16-bit 48KHz stereo PCM audio source.
 
@@ -113,6 +112,7 @@ class PCMAudio(AudioSource):
         if len(ret) != OpusEncoder.FRAME_SIZE:
             return b''
         return ret
+
 
 class FFmpegAudio(AudioSource):
     """Represents an FFmpeg (or AVConv) based AudioSource.
@@ -165,6 +165,7 @@ class FFmpegAudio(AudioSource):
             log.info('ffmpeg process %s successfully terminated with return code of %s.', proc.pid, proc.returncode)
 
         self._process = self._stdout = None
+
 
 class FFmpegPCMAudio(FFmpegAudio):
     """An audio source from FFmpeg (or AVConv).
@@ -227,6 +228,7 @@ class FFmpegPCMAudio(FFmpegAudio):
 
     def is_opus(self):
         return False
+
 
 class FFmpegOpusAudio(FFmpegAudio):
     """An audio source from FFmpeg (or AVConv).
@@ -425,7 +427,7 @@ class FFmpegOpusAudio(FFmpegAudio):
             probefunc = method
             fallback = cls._probe_codec_fallback
         else:
-            raise TypeError("Expected str or callable for parameter 'probe', " \
+            raise TypeError("Expected str or callable for parameter 'probe', "
                             "not '{0.__class__.__name__}'" .format(method))
 
         codec = bitrate = None
@@ -462,13 +464,13 @@ class FFmpegOpusAudio(FFmpegAudio):
 
             codec = streamdata.get('codec_name')
             bitrate = int(streamdata.get('bit_rate', 0))
-            bitrate = max(round(bitrate/1000, 0), 512)
+            bitrate = max(round(bitrate / 1000, 0), 512)
 
         return codec, bitrate
 
     @staticmethod
     def _probe_codec_fallback(source, executable='ffmpeg'):
-        args = [executable, '-hide_banner', '-i',  source]
+        args = [executable, '-hide_banner', '-i', source]
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         out, _ = proc.communicate(timeout=20)
         output = out.decode('utf8')
@@ -489,6 +491,7 @@ class FFmpegOpusAudio(FFmpegAudio):
 
     def is_opus(self):
         return True
+
 
 class PCMVolumeTransformer(AudioSource):
     """Transforms a previous :class:`AudioSource` to have volume controls.
@@ -538,27 +541,18 @@ class PCMVolumeTransformer(AudioSource):
         ret = self.original.read()
         return audioop.mul(ret, 2, min(self._volume, 2.0))
 
-class AudioPlayer(threading.Thread):
+
+class AudioPlayer:
     DELAY = OpusEncoder.FRAME_LENGTH / 1000.0
 
-    def __init__(self, source, client, *, after=None):
-        threading.Thread.__init__(self)
-        self.daemon = True
+    def __init__(self, source, client):
         self.source = source
         self.client = client
-        self.after = after
-
-        self._end = threading.Event()
-        self._resumed = threading.Event()
-        self._resumed.set() # we are not paused
-        self._current_error = None
+        self._resumed = asyncio.Event()
+        self._resumed.set()
         self._connected = client._connected
-        self._lock = threading.Lock()
 
-        if after is not None and not callable(after):
-            raise TypeError('Expected a callable for the "after" parameter.')
-
-    def _do_run(self):
+    async def _do_run(self):
         self.loops = 0
         self._start = time.perf_counter()
 
@@ -566,17 +560,17 @@ class AudioPlayer(threading.Thread):
         play_audio = self.client.send_audio_packet
         self._speak(True)
 
-        while not self._end.is_set():
+        while True:
             # are we paused?
             if not self._resumed.is_set():
                 # wait until we aren't
-                self._resumed.wait()
+                await self._resumed.wait()
                 continue
 
             # are we disconnected from voice?
             if not self._connected.is_set():
                 # wait until we are connected
-                self._connected.wait()
+                await self._connected.wait()
                 # reset our internal data
                 self.loops = 0
                 self._start = time.perf_counter()
@@ -588,41 +582,25 @@ class AudioPlayer(threading.Thread):
                 self.stop()
                 break
 
-            # TODO: profile timing accuracy/validity
-
             play_audio(data, encode=not self.source.is_opus())
             next_time = self._start + self.DELAY * self.loops
             delay = max(0, self.DELAY + (next_time - time.perf_counter()))
-            time.sleep(delay)
+            await asyncio.sleep(delay)
 
-    def run(self):
+    async def run(self):
         try:
-            self._do_run()
-        except Exception as exc:
-            self._current_error = exc
+            await self._do_run()
+        except Exception:
             self.stop()
+            raise
         finally:
             self.source.cleanup()
-            self._call_after()
 
-    def _call_after(self):
-        error = self._current_error
-
-        if self.after is not None:
-            try:
-                self.after(error)
-            except Exception as exc:
-                log.exception('Calling the after function failed.')
-                exc.__context__ = error
-                traceback.print_exception(type(exc), exc, exc.__traceback__)
-        elif error:
-            msg = 'Exception in voice thread {}'.format(self.name)
-            log.exception(msg, exc_info=error)
-            print(msg, file=sys.stderr)
-            traceback.print_exception(type(error), error, error.__traceback__)
+    def start(self):
+        self.loop = asyncio.create_task(self.run())
 
     def stop(self):
-        self._end.set()
+        self.loop.cancel()
         self._resumed.set()
         self._speak(False)
 
