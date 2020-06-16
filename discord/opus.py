@@ -35,7 +35,7 @@ import os.path
 import bisect
 import threading
 
-from collections import deque
+from collections import deque, defaultdict
 from bisect import insort
 
 from . import utils
@@ -439,6 +439,23 @@ class BasePacketDecoder:
         raise NotImplementedError
 
 
+class SimplePacketDecoder(BasePacketDecoder):
+    def __init__(self, callback):
+        self.callback = callback
+        self.opus_decoders = defaultdict(Decoder)
+
+    def feed_rtcp(self, packet):
+        pass
+
+    def feed_rtp(self, packet):
+        pcm = self.opus_decoders[packet.ssrc].decode(packet.decrypted_data)
+        self.callback(pcm, packet.decrypted_data, packet)
+
+    def reset(self, *ssrcs):
+        for ssrc in ssrcs or list(self.opus_decoders):
+            del self.opus_decoders[ssrc]
+
+
 class BufferedPacketDecoder(BasePacketDecoder):
     """Buffers and decodes packets from a single ssrc"""
 
@@ -556,7 +573,7 @@ class BufferedPacketDecoder(BasePacketDecoder):
         # How many packets we need to get to full
         full_fill = self.buffer_size - half_fill
 
-        print(f"Starting with {pre_fill}, collecting {half_fill}, then {full_fill}")
+        log.debug(f"Starting with {pre_fill}, collecting {half_fill}, then {full_fill}")
 
         while not self._buffer:
             yield None, None
@@ -633,17 +650,19 @@ class BufferedDecoder(threading.Thread):
             self.initial_buffer.append(packet)
 
     def feed_rtp(self, packet):
+        log.debug(f"feed_rtp: {packet}")
         dec = self._get_decoder(packet.ssrc)
         if dec:
             return dec.feed_rtp(packet)
 
     def feed_rtcp(self, packet):
+        log.debug(f"feed_rtcp: {packet}")
         # RTCP packets themselves don't really belong to a decoder
         # I could split the reports up or send to all idk its weird
 
         dec = self._get_decoder(packet.ssrc)
         if dec:
-            print(f"RTCP packet: {packet}")
+            log.debug(f"RTCP packet: {packet}")
             return dec.feed_rtcp(packet)
 
     def drop_ssrc(self, ssrc):

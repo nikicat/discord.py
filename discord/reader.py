@@ -33,7 +33,7 @@ import logging
 import threading
 
 from . import rtp
-from .opus import Decoder, BufferedDecoder
+from .opus import Decoder, BufferedDecoder, SimpleDecoder
 from .errors import DiscordException, ClientException
 
 try:
@@ -173,16 +173,10 @@ class VoiceData:
 
 
 class AudioReader(threading.Thread):
-    def __init__(self, sink, client, *, after=None):
+    def __init__(self, sink, client):
         super().__init__(daemon=True)
         self.sink = sink
         self.client = client
-        self.after = after
-
-        if after is not None and not callable(after):
-            raise TypeError('Expected a callable for the "after" parameter.')
-
-        self.after = after
 
         self.box = nacl.secret.SecretBox(bytes(client.secret_key))
         self.decrypt_rtp = getattr(self, '_decrypt_rtp_' + client._mode)
@@ -190,12 +184,8 @@ class AudioReader(threading.Thread):
 
         self._current_error = None
         self._end = threading.Event()
-        self._decoder_lock = threading.Lock()
 
-        self.decoder = BufferedDecoder(self)
-        self.decoder.start()
-
-        # TODO: inject sink functions
+        self.demuxer = Demuxer(self._write_to_sink)
 
     @property
     def connected(self):
@@ -258,10 +248,10 @@ class AudioReader(threading.Thread):
         return header + result
 
     def _reset_decoders(self, *ssrcs):
-        self.decoder.reset(*ssrcs)
+        self.demuxer.reset(*ssrcs)
 
     def _stop_decoders(self, **kwargs):
-        self.decoder.stop(**kwargs)
+        self.demuxer.stop(**kwargs)
 
     def _ssrc_removed(self, ssrc):
         # An user has disconnected but there still may be
@@ -270,16 +260,15 @@ class AudioReader(threading.Thread):
         # I *think* this is the correct way to do this
         # Depending on how many leftovers I end up with I may reconsider
 
-        self.decoder.drop_ssrc(ssrc)  # flush=True?
+        self.demuxer.drop_ssrc(ssrc)  # flush=True?
 
     def _get_user(self, packet):
         _, user_id = self.client._get_ssrc_mapping(ssrc=packet.ssrc)
         # may need to change this for calls or something
         return self.client.guild.get_member(user_id)
 
-    def _write_to_sink(self, pcm, opus, packet):
+    def _write_to_sink(self, data, packet):
         try:
-            data = opus if self.sink.wants_opus() else pcm
             user = self._get_user(packet)
             self.sink.write(VoiceData(data, user, packet))
             # TODO: remove weird error handling in favor of injected functions
@@ -291,9 +280,7 @@ class AudioReader(threading.Thread):
             log.exception(f"Exception when writing to sink: {exc}")
 
     def _set_sink(self, sink):
-        with self._decoder_lock:
-            self.sink = sink
-        # if i were to fire a sink change mini-event it would be here
+        self.sink = sink
 
     def _do_run(self):
         while not self._end.is_set():
@@ -315,8 +302,7 @@ class AudioReader(threading.Thread):
                 if e.errno == 10038:  # ENOTSOCK
                     continue
 
-                log.exception("Socket error in reader thread ")
-                print(f"Socket error in reader thread: {e} {t0}")
+                log.exception(f"Socket error in reader thread: {e}")
 
                 with self.client._connecting:
                     timed_out = self.client._connecting.wait(20)
@@ -324,28 +310,25 @@ class AudioReader(threading.Thread):
                 if not timed_out:
                     raise
                 elif self.client.is_connected():
-                    print(f"Reconnected in {time.time()-t0:.4f}s")
+                    log.debug(f"Reconnected in {time.time()-t0:.4f}s")
                     continue
                 else:
                     raise
 
             try:
-                packet = None
                 if not rtp.is_rtcp(raw_data):
                     packet = rtp.decode(raw_data)
                     packet.decrypted_data = self.decrypt_rtp(packet)
                 else:
                     packet = rtp.decode(self.decrypt_rtcp(raw_data))
+                    log.debug(f"Received rtcp: {packet}")
                     if not isinstance(packet, rtp.ReceiverReportPacket):
-                        print(packet)
-
+                        log.warning(f"Not a ReceiverReportPacket: {packet}")
                         # TODO: Fabricate and send SenderReports and see what happens
-
-                    self.decoder.feed_rtcp(packet)
                     continue
 
             except CryptoError:
-                log.exception("CryptoError decoding packet %s", packet)
+                log.exception("CryptoError decoding packet %s", raw_data)
                 continue
 
             except Exception as exc:
@@ -353,9 +336,12 @@ class AudioReader(threading.Thread):
 
             else:
                 if packet.ssrc not in self.client._ssrcs:
-                    log.debug("Received packet for unknown ssrc %s", packet.ssrc)
-
-                self.decoder.feed_rtp(packet)
+                    log.warning("Received packet for unknown ssrc %s", packet.ssrc)
+                else:
+                    if self.sink.wants_opus():
+                        self._write_to_sink(packet.decrypted_data, packet)
+                    else:
+                        self.demuxer.feed_rtp(packet)
 
     def stop(self):
         self._end.set()
@@ -376,15 +362,6 @@ class AudioReader(threading.Thread):
                 self.sink.cleanup()
             except Exception as exc:
                 log.exception(f"Error during sink cleanup: {exc}")
-
-            self._call_after()
-
-    def _call_after(self):
-        if self.after is not None:
-            try:
-                self.after(self._current_error)
-            except Exception:
-                log.exception('Calling the after function failed.')
 
     def is_listening(self):
         return not self._end.is_set()
