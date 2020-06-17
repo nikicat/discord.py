@@ -24,6 +24,7 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 """
 
+import asyncio
 import time
 import wave
 import select
@@ -31,10 +32,15 @@ import socket
 import audioop
 import logging
 import threading
+from collections import defaultdict
+from dataclasses import dataclass
+from functools import partial
 
 from . import rtp
-from .opus import Decoder, BufferedDecoder, SimpleDecoder
+from .opus import Decoder
 from .errors import DiscordException, ClientException
+from .member import Member
+from .rtp import RTPPacket
 
 try:
     import nacl.secret
@@ -48,9 +54,6 @@ __all__ = [
     'AudioSink',
     'WaveSink',
     'PCMVolumeTransformerFilter',
-    'ConditionalFilter',
-    'TimedFilter',
-    'UserFilter',
     'SinkExit'
 ]
 
@@ -59,21 +62,28 @@ class SinkExit(DiscordException):
     """A signal type exception (like ``GeneratorExit``) to raise in a Sink's write() method to stop it."""
 
 
+@dataclass
+class VoiceData:
+    pcm: bytes
+    user: Member
+    packet: RTPPacket
+
+
 class AudioSink:
     def __del__(self):
         self.cleanup()
 
-    def write(self, data):
+    def write(self, data: VoiceData):
         raise NotImplementedError
 
-    def wants_opus(self):
-        return False
+    def speech_started(self, user: Member):
+        raise NotImplementedError
+
+    def speech_ended(self, user: Member):
+        raise NotImplementedError
 
     def cleanup(self):
         pass
-
-    def pack_data(self, data, user=None, packet=None):
-        return VoiceData(data, user, packet)  # is this even necessary?
 
 
 class WaveSink(AudioSink):
@@ -114,78 +124,21 @@ class PCMVolumeTransformerFilter(AudioSink):
         data = audioop.mul(data.data, 2, min(self._volume, 2.0))
         self.destination.write(data)
 
-# I need some sort of filter sink with a predicate or something
-# Which means I need to sort out the write() signature issue
-# Also need something to indicate a sink is "done", probably
-# something like raising an exception and handling that in the write loop
-# Maybe should rename some of these to Filter instead of Sink
 
-
-class ConditionalFilter(AudioSink):
-    def __init__(self, destination, predicate):
-        self.destination = destination
-        self.predicate = predicate
-
-    def write(self, data):
-        if self.predicate(data):
-            self.destination.write(data)
-
-
-class TimedFilter(ConditionalFilter):
-    def __init__(self, destination, duration, *, start_on_init=False):
-        super().__init__(destination, self._predicate)
-        self.duration = duration
-        if start_on_init:
-            self.start_time = self.get_time()
-        else:
-            self.start_time = None
-            self.write = self._write_once
-
-    def _write_once(self, data):
-        self.start_time = self.get_time()
-        super().write(data)
-        self.write = super().write
-
-    def _predicate(self, data):
-        return self.start_time and self.get_time() - self.start_time < self.duration
-
-    def get_time(self):
-        return time.time()
-
-
-class UserFilter(ConditionalFilter):
-    def __init__(self, destination, user):
-        super().__init__(destination, self._predicate)
-        self.user = user
-
-    def _predicate(self, data):
-        return data.user == self.user
-
-
-# rename 'data' to 'payload'? or 'opus'? something else?
-class VoiceData:
-    __slots__ = ('data', 'user', 'packet')
-
-    def __init__(self, data, user, packet):
-        self.data = data
-        self.user = user
-        self.packet = packet
-
-
-class AudioReader(threading.Thread):
+class AudioReader:
     def __init__(self, sink, client):
-        super().__init__(daemon=True)
         self.sink = sink
         self.client = client
+        self.decoders = defaultdict(partial(BufferedAudioDecoder, self))
 
         self.box = nacl.secret.SecretBox(bytes(client.secret_key))
         self.decrypt_rtp = getattr(self, '_decrypt_rtp_' + client._mode)
         self.decrypt_rtcp = getattr(self, '_decrypt_rtcp_' + client._mode)
 
         self._current_error = None
-        self._end = threading.Event()
 
-        self.demuxer = Demuxer(self._write_to_sink)
+    def start(self):
+        self.loop = asyncio.create_task(self._do_run())
 
     @property
     def connected(self):
@@ -247,30 +200,31 @@ class AudioReader(threading.Thread):
 
         return header + result
 
-    def _reset_decoders(self, *ssrcs):
-        self.demuxer.reset(*ssrcs)
+    def _reset_decoders(self, ssrc=None):
+        log.debug(f"Reseting decoder(s) {ssrc}")
+        if ssrc in self.decoders:
+            del self.decoders[ssrc]
+        else:
+            self.decoders.clear()
 
-    def _stop_decoders(self, **kwargs):
-        self.demuxer.stop(**kwargs)
+    def _stop_decoders(self):
+        log.debug("Stopping decoders")
+        self.decoders.clear()
 
     def _ssrc_removed(self, ssrc):
-        # An user has disconnected but there still may be
-        # packets from them left in the buffer to read
-        # For now we're just going to kill the decoder and see how that works out
-        # I *think* this is the correct way to do this
-        # Depending on how many leftovers I end up with I may reconsider
-
-        self.demuxer.drop_ssrc(ssrc)  # flush=True?
+        log.debug(f"Removed ssrc {ssrc}")
+        if ssrc in self.decoders:
+            del self.decoders[ssrc]
 
     def _get_user(self, packet):
         _, user_id = self.client._get_ssrc_mapping(ssrc=packet.ssrc)
         # may need to change this for calls or something
         return self.client.guild.get_member(user_id)
 
-    def _write_to_sink(self, data, packet):
+    def feed(self, packet, pcm):
         try:
             user = self._get_user(packet)
-            self.sink.write(VoiceData(data, user, packet))
+            self.sink.write(VoiceData(pcm, user, packet))
             # TODO: remove weird error handling in favor of injected functions
         except SinkExit:
             log.info("Shutting down reader thread %s", self)
@@ -279,28 +233,24 @@ class AudioReader(threading.Thread):
         except Exception as exc:
             log.exception(f"Exception when writing to sink: {exc}")
 
+    def speech_started(self, ssrc):
+        self.sink.speech_started(self._get_user(ssrc))
+
+    def speech_ended(self, ssrc):
+        self.sink.speech_ended(self._get_user(ssrc))
+
     def _set_sink(self, sink):
         self.sink = sink
 
-    def _do_run(self):
-        while not self._end.is_set():
-            if not self.connected.is_set():
-                self.connected.wait()
-
-            ready, _, err = select.select([self.client.socket], [],
-                                          [self.client.socket], 0.01)
-            if not ready:
-                if err:
-                    print("Socket error")
-                continue
-
+    async def _do_run(self):
+        reader = None
+        while True:
+            if reader is None:
+                reader, _ = await asyncio.open_connection(sock=self.client.socket)
             try:
-                raw_data = self.client.socket.recv(4096)
-            except socket.error as e:
+                raw_data = await reader.read()
+            except Exception as e:
                 t0 = time.time()
-
-                if e.errno == 10038:  # ENOTSOCK
-                    continue
 
                 log.exception(f"Socket error in reader thread: {e}")
 
@@ -338,10 +288,7 @@ class AudioReader(threading.Thread):
                 if packet.ssrc not in self.client._ssrcs:
                     log.warning("Received packet for unknown ssrc %s", packet.ssrc)
                 else:
-                    if self.sink.wants_opus():
-                        self._write_to_sink(packet.decrypted_data, packet)
-                    else:
-                        self.demuxer.feed_rtp(packet)
+                    self.decoders[packet.ssrc].feed(packet)
 
     def stop(self):
         self._end.set()
@@ -365,3 +312,34 @@ class AudioReader(threading.Thread):
 
     def is_listening(self):
         return not self._end.is_set()
+
+
+class BufferedAudioDecoder:
+    def __init__(self, reader: AudioReader):
+        self.reader = reader
+        self.decoder = Decoder()
+        self.next_seq = 0
+        self.silencer = None
+
+    def feed(self, packet: RTPPacket):
+        if packet.sequence == self.next_seq:
+            self.next_seq += 1
+            pcm = self.decoder.decode(packet.decrypted_data)
+        elif packet.sequence > self.next_seq:
+            self.next_seq = packet.sequence + 1
+            pcm = self.decoder.decode(packet.decrypted_data, fec=True)
+            log.debug(f"Received packet with a gap {packet.sequence - self.next_seq}, using FEC")
+        elif packet.sequence < self.next_seq:
+            log.debug(f"Received out-of-order packet {self.next_seq - packet.sequence}, skipping")
+            return
+        if self.silencer is None:
+            self.reader.speech_started(packet.ssrc)
+        else:
+            self.silencer.cancel()
+        self.silencer = asyncio.create_task(self.end_speech(packet.ssrc))
+        self.reader.feed(packet, pcm)
+
+    async def end_speech(self, ssrc):
+        await asyncio.sleep(0.05)
+        self.reader.speech_ended(ssrc)
+        self.silencer = None

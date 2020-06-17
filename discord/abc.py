@@ -36,7 +36,6 @@ from .permissions import PermissionOverwrite, Permissions
 from .role import Role
 from .invite import Invite
 from .file import File
-from .voice_client import VoiceClient
 from . import utils
 
 class _Undefined:
@@ -259,7 +258,7 @@ class GuildChannel:
                 options['permission_overwrites'] = [c._asdict() for c in category._overwrites]
         else:
             await self._move(position, parent_id=parent_id, lock_permissions=lock_permissions, reason=reason)
-        
+
         overwrites = options.get('overwrites', None)
         if overwrites:
             perms = []
@@ -1055,6 +1054,7 @@ class Connectable(metaclass=abc.ABCMeta):
         :class:`~discord.VoiceClient`
             A voice client that is fully connected to the voice server.
         """
+        from .voice_client import VoiceClient
         key_id, _ = self._get_voice_client_key()
         state = self._state
 

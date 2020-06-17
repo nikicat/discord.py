@@ -751,6 +751,8 @@ class DiscordVoiceWebSocket(websockets.client.WebSocketClientProtocol):
             self._connection._add_ssrc(int(data['user_id']), data['audio_ssrc'])
         elif op == self.CLIENT_DISCONNECT:
             self._connection._remove_ssrc(user_id=int(data['user_id']))
+        else:
+            log.debug(f"Received unknown WebSocket message: {op} [{data}]")
 
     async def initial_connection(self, data):
         state = self._connection
