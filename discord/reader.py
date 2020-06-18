@@ -27,26 +27,20 @@ DEALINGS IN THE SOFTWARE.
 import asyncio
 import time
 import wave
-import select
 import socket
 import audioop
 import logging
-import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import partial
+
+from nacl.exceptions import CryptoError
 
 from . import rtp
 from .opus import Decoder
 from .errors import DiscordException, ClientException
 from .member import Member
 from .rtp import RTPPacket
-
-try:
-    import nacl.secret
-    from nacl.exceptions import CryptoError
-except ImportError:
-    pass
 
 log = logging.getLogger(__name__)
 
@@ -130,15 +124,14 @@ class AudioReader:
         self.sink = sink
         self.client = client
         self.decoders = defaultdict(partial(BufferedAudioDecoder, self))
-
-        self.box = nacl.secret.SecretBox(bytes(client.secret_key))
         self.decrypt_rtp = getattr(self, '_decrypt_rtp_' + client._mode)
         self.decrypt_rtcp = getattr(self, '_decrypt_rtcp_' + client._mode)
 
-        self._current_error = None
-
     def start(self):
-        self.loop = asyncio.create_task(self._do_run())
+        self.loop = asyncio.create_task(self.run())
+
+    def stop(self):
+        self.loop.cancel()
 
     @property
     def connected(self):
@@ -147,7 +140,7 @@ class AudioReader:
     def _decrypt_rtp_xsalsa20_poly1305(self, packet):
         nonce = bytearray(24)
         nonce[:12] = packet.header
-        result = self.box.decrypt(bytes(packet.data), bytes(nonce))
+        result = self.client.box.decrypt(bytes(packet.data), bytes(nonce))
 
         if packet.extended:
             offset = packet.update_ext_headers(result)
@@ -158,14 +151,14 @@ class AudioReader:
     def _decrypt_rtcp_xsalsa20_poly1305(self, data):
         nonce = bytearray(24)
         nonce[:8] = data[:8]
-        result = self.box.decrypt(data[8:], bytes(nonce))
+        result = self.client.box.decrypt(data[8:], bytes(nonce))
 
         return data[:8] + result
 
     def _decrypt_rtp_xsalsa20_poly1305_suffix(self, packet):
         nonce = packet.data[-24:]
         voice_data = packet.data[:-24]
-        result = self.box.decrypt(bytes(voice_data), bytes(nonce))
+        result = self.client.box.decrypt(bytes(voice_data), bytes(nonce))
 
         if packet.extended:
             offset = packet.update_ext_headers(result)
@@ -176,7 +169,7 @@ class AudioReader:
     def _decrypt_rtcp_xsalsa20_poly1305_suffix(self, data):
         nonce = data[-24:]
         header = data[:8]
-        result = self.box.decrypt(data[8:-24], nonce)
+        result = self.client.box.decrypt(data[8:-24], nonce)
 
         return header + result
 
@@ -184,7 +177,7 @@ class AudioReader:
         nonce = bytearray(24)
         nonce[:4] = packet.data[-4:]
         voice_data = packet.data[:-4]
-        result = self.box.decrypt(bytes(voice_data), bytes(nonce))
+        result = self.client.box.decrypt(bytes(voice_data), bytes(nonce))
 
         if packet.extended:
             offset = packet.update_ext_headers(result)
@@ -196,7 +189,7 @@ class AudioReader:
         nonce = bytearray(24)
         nonce[:4] = data[-4:]
         header = data[:8]
-        result = self.box.decrypt(data[8:-4], bytes(nonce))
+        result = self.client.box.decrypt(data[8:-4], bytes(nonce))
 
         return header + result
 
@@ -216,16 +209,15 @@ class AudioReader:
         if ssrc in self.decoders:
             del self.decoders[ssrc]
 
-    def _get_user(self, packet):
-        _, user_id = self.client._get_ssrc_mapping(ssrc=packet.ssrc)
+    def _get_user(self, ssrc):
+        _, user_id = self.client._get_ssrc_mapping(ssrc=ssrc)
         # may need to change this for calls or something
         return self.client.guild.get_member(user_id)
 
     def feed(self, packet, pcm):
         try:
-            user = self._get_user(packet)
+            user = self._get_user(packet.ssrc)
             self.sink.write(VoiceData(pcm, user, packet))
-            # TODO: remove weird error handling in favor of injected functions
         except SinkExit:
             log.info("Shutting down reader thread %s", self)
             self.stop()
@@ -243,23 +235,17 @@ class AudioReader:
         self.sink = sink
 
     async def _do_run(self):
-        reader = None
+        loop = asyncio.get_running_loop()
         while True:
-            if reader is None:
-                reader, _ = await asyncio.open_connection(sock=self.client.socket)
             try:
-                raw_data = await reader.read()
-            except Exception as e:
+                raw_data = await loop.sock_recv(self.client.socket, 10000)
+            except socket.error as e:
                 t0 = time.time()
 
-                log.exception(f"Socket error in reader thread: {e}")
+                log.exception(f"Socket error in reader loop: {e}")
+                await self.client._connecting.wait()
 
-                with self.client._connecting:
-                    timed_out = self.client._connecting.wait(20)
-
-                if not timed_out:
-                    raise
-                elif self.client.is_connected():
+                if self.client.is_connected():
                     log.debug(f"Reconnected in {time.time()-t0:.4f}s")
                     continue
                 else:
@@ -290,19 +276,12 @@ class AudioReader:
                 else:
                     self.decoders[packet.ssrc].feed(packet)
 
-    def stop(self):
-        self._end.set()
-
-    def run(self):
+    async def run(self):
         try:
-            self._do_run()
-        except socket.error as exc:
-            self._current_error = exc
-            self.stop()
+            await self._do_run()
         except Exception as exc:
             log.exception(f"Exception in _do_run(): {exc}")
-            self._current_error = exc
-            self.stop()
+            raise
         finally:
             self._stop_decoders()
             try:

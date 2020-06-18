@@ -43,7 +43,6 @@ import asyncio
 import socket
 import logging
 import struct
-import threading
 
 from . import opus
 from .backoff import ExponentialBackoff
@@ -101,17 +100,12 @@ class VoiceClient:
         self.socket = None
         self.loop = state.loop
         self._state = state
-        # this will be used in the AudioPlayer thread
-        self._connected = threading.Event()
+        self._connected = asyncio.Event()
 
         self._handshaking = False
-        self._handshake_check = asyncio.Lock()
         self._handshake_complete = asyncio.Event()
-        # this will be used in the AudioReader thread
-        self._connecting = threading.Condition()
 
         self._mode = None
-        self._connections = 0
         self.sequence = 0
         self.timestamp = 0
         self._nonce = 0
@@ -145,6 +139,9 @@ class VoiceClient:
         else:
             setattr(self, attr, val + value)
 
+    def set_secret_key(self, secret_key):
+        self.box = nacl.secret.SecretBox(bytes(secret_key))
+
     # connection related
 
     async def start_handshake(self):
@@ -153,7 +150,6 @@ class VoiceClient:
         guild_id, channel_id = self.channel._get_voice_state_pair()
         state = self._state
         self.main_ws = ws = state._get_websocket(guild_id)
-        self._connections += 1
 
         # request joining
         await ws.voice_state(guild_id, channel_id)
@@ -178,12 +174,10 @@ class VoiceClient:
             self._state._remove_voice_client(key_id)
 
     async def _create_socket(self, server_id, data):
-        async with self._handshake_check:
-            if self._handshaking:
-                log.info("Ignoring voice server update while handshake is in progress")
-                return
-            self._handshaking = True
-
+        if self._handshaking:
+            log.info("Ignoring voice server update while handshake is in progress")
+            return
+        self._handshaking = True
         self._connected.clear()
         self.session_id = self.main_ws.session_id
         self.server_id = server_id
@@ -215,21 +209,17 @@ class VoiceClient:
 
         self._handshake_complete.set()
 
-    async def connect(self, *, reconnect=True, _tries=0, do_handshake=True):
+    async def connect(self, *, reconnect=True, _tries=0):
         log.info('Connecting to voice...')
-        try:
-            del self.secret_key
-        except AttributeError:
-            pass
+        self.box = None
 
-        if do_handshake:
-            await self.start_handshake()
+        await self.start_handshake()
 
         try:
             self.ws = await DiscordVoiceWebSocket.from_client(self)
             self._handshaking = False
             self._connected.clear()
-            while not hasattr(self, 'secret_key'):
+            while self.box is None:
                 await self.ws.poll_event()
             self._connected.set()
         except (ConnectionClosed, asyncio.TimeoutError):
@@ -295,6 +285,7 @@ class VoiceClient:
         finally:
             if self.socket:
                 self.socket.close()
+                self.socket = None
 
     async def move_to(self, channel):
         """|coro|
@@ -379,25 +370,22 @@ class VoiceClient:
         return encrypt_packet(header, data)
 
     def _encrypt_xsalsa20_poly1305(self, header, data):
-        box = nacl.secret.SecretBox(bytes(self.secret_key))
         nonce = bytearray(24)
         nonce[:12] = header
 
-        return header + box.encrypt(bytes(data), bytes(nonce)).ciphertext
+        return header + self.box.encrypt(bytes(data), bytes(nonce)).ciphertext
 
     def _encrypt_xsalsa20_poly1305_suffix(self, header, data):
-        box = nacl.secret.SecretBox(bytes(self.secret_key))
         nonce = nacl.utils.random(nacl.secret.SecretBox.NONCE_SIZE)
 
-        return header + box.encrypt(bytes(data), nonce).ciphertext + nonce
+        return header + self.box.encrypt(bytes(data), nonce).ciphertext + nonce
 
     def _encrypt_xsalsa20_poly1305_lite(self, header, data):
-        box = nacl.secret.SecretBox(bytes(self.secret_key))
         nonce = bytearray(24)
         self.checked_add('_nonce', 1, 4294967295)
         nonce[:4] = self._nonce.to_bytes(4, 'big')
 
-        return header + box.encrypt(bytes(data), bytes(nonce)).ciphertext + nonce[:4]
+        return header + self.box.encrypt(bytes(data), bytes(nonce)).ciphertext + nonce[:4]
 
     def send_audio_packet(self, data, *, encode=True):
         """Sends an audio packet composed of the data.
@@ -437,7 +425,7 @@ class VoiceClient:
 
     # send api related
 
-    def play(self, source, *, after=None):
+    def play(self, source):
         """Plays an :class:`AudioSource`.
 
         The finalizer, ``after`` is called after the source has been exhausted
@@ -478,7 +466,7 @@ class VoiceClient:
         if not self.encoder and not source.is_opus():
             self.encoder = opus.Encoder()
 
-        self._player = AudioPlayer(source, self, after=after)
+        self._player = AudioPlayer(source, self)
         self._player.start()
 
     def is_playing(self):

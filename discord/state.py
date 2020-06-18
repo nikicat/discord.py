@@ -894,7 +894,7 @@ class ConnectionState:
 
         vc = self._get_voice_client(key_id)
         if vc is not None:
-            asyncio.ensure_future(vc._create_socket(key_id, data))
+            asyncio.create_task(vc._create_socket(key_id, data))
 
     def parse_typing_start(self, data):
         channel, guild = self._get_guild_channel(data)
