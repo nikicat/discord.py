@@ -64,16 +64,7 @@ class VoiceData:
 
 
 class AudioSink:
-    def __del__(self):
-        self.cleanup()
-
     def write(self, data: VoiceData):
-        raise NotImplementedError
-
-    def speech_started(self, user: Member):
-        raise NotImplementedError
-
-    def speech_ended(self, user: Member):
         raise NotImplementedError
 
     def cleanup(self):
@@ -225,12 +216,6 @@ class AudioReader:
         except Exception as exc:
             log.exception(f"Exception when writing to sink: {exc}")
 
-    def speech_started(self, ssrc):
-        self.sink.speech_started(self._get_user(ssrc))
-
-    def speech_ended(self, ssrc):
-        self.sink.speech_ended(self._get_user(ssrc))
-
     def _set_sink(self, sink):
         self.sink = sink
 
@@ -285,7 +270,7 @@ class AudioReader:
         finally:
             self._stop_decoders()
             try:
-                self.sink.cleanup()
+                await self.sink.cleanup()
             except Exception as exc:
                 log.exception(f"Error during sink cleanup: {exc}")
 
@@ -298,7 +283,6 @@ class BufferedAudioDecoder:
         self.reader = reader
         self.decoder = Decoder()
         self.next_seq = 0
-        self.silencer = None
 
     def feed(self, packet: RTPPacket):
         if packet.sequence == self.next_seq:
@@ -311,14 +295,4 @@ class BufferedAudioDecoder:
         elif packet.sequence < self.next_seq:
             log.debug(f"Received out-of-order packet {self.next_seq - packet.sequence}, skipping")
             return
-        if self.silencer is None:
-            self.reader.speech_started(packet.ssrc)
-        else:
-            self.silencer.cancel()
-        self.silencer = asyncio.create_task(self.end_speech(packet.ssrc))
         self.reader.feed(packet, pcm)
-
-    async def end_speech(self, ssrc):
-        await asyncio.sleep(0.05)
-        self.reader.speech_ended(ssrc)
-        self.silencer = None
