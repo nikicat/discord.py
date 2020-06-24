@@ -790,6 +790,7 @@ class DiscordVoiceWebSocket(websockets.client.WebSocketClientProtocol):
         self._connection.set_secret_key(data.get('secret_key'))
 
     async def _do_hacks(self):
+        log.debug("Doing hacks")
         # Everything below this is a hack because discord keeps breaking things
 
         # hack #1

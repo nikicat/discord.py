@@ -32,7 +32,6 @@ import audioop
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from functools import partial
 
 from nacl.exceptions import CryptoError
 
@@ -114,7 +113,7 @@ class AudioReader:
     def __init__(self, sink, client):
         self.sink = sink
         self.client = client
-        self.decoders = defaultdict(partial(BufferedAudioDecoder, self))
+        self.decoders = defaultdict(BufferedAudioDecoder)
         self.decrypt_rtp = getattr(self, '_decrypt_rtp_' + client._mode)
         self.decrypt_rtcp = getattr(self, '_decrypt_rtcp_' + client._mode)
 
@@ -256,10 +255,9 @@ class AudioReader:
                 log.exception(f"Error unpacking packet: {exc}")
 
             else:
-                if packet.ssrc not in self.client._ssrcs:
-                    log.warning("Received packet for unknown ssrc %s", packet.ssrc)
-                else:
-                    self.decoders[packet.ssrc].feed(packet)
+                pcm = self.decoders[packet.ssrc].decode(packet)
+                if pcm:
+                    self.feed(packet, pcm)
 
     async def run(self):
         try:
@@ -279,12 +277,11 @@ class AudioReader:
 
 
 class BufferedAudioDecoder:
-    def __init__(self, reader: AudioReader):
-        self.reader = reader
+    def __init__(self):
         self.decoder = Decoder()
         self.next_seq = 0
 
-    def feed(self, packet: RTPPacket):
+    def decode(self, packet: RTPPacket):
         if packet.sequence == self.next_seq:
             self.next_seq += 1
             pcm = self.decoder.decode(packet.decrypted_data)
@@ -294,5 +291,5 @@ class BufferedAudioDecoder:
             log.debug(f"Received packet with a gap {packet.sequence - self.next_seq}, using FEC")
         elif packet.sequence < self.next_seq:
             log.debug(f"Received out-of-order packet {self.next_seq - packet.sequence}, skipping")
-            return
-        self.reader.feed(packet, pcm)
+            pcm = None
+        return pcm

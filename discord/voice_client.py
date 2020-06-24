@@ -148,8 +148,7 @@ class VoiceClient:
         log.info('Starting voice handshake...')
 
         guild_id, channel_id = self.channel._get_voice_state_pair()
-        state = self._state
-        self.main_ws = ws = state._get_websocket(guild_id)
+        self.main_ws = ws = self._state._get_websocket(guild_id)
 
         # request joining
         await ws.voice_state(guild_id, channel_id)
