@@ -528,7 +528,6 @@ class VoiceClient:
             raise ClientException('Already receiving audio.')
 
         self._reader = AudioReader(sink, self)
-        self._reader.start()
 
     def is_listening(self):
         """Indicates if we're currently receiving audio."""

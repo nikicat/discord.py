@@ -117,12 +117,6 @@ class AudioReader:
         self.decrypt_rtp = getattr(self, '_decrypt_rtp_' + client._mode)
         self.decrypt_rtcp = getattr(self, '_decrypt_rtcp_' + client._mode)
 
-    def start(self):
-        self.loop = asyncio.create_task(self.run())
-
-    def stop(self):
-        self.loop.cancel()
-
     @property
     def connected(self):
         return self.client._connected
@@ -218,7 +212,15 @@ class AudioReader:
     def _set_sink(self, sink):
         self.sink = sink
 
-    async def _do_run(self):
+    async def listen_voice(self):
+        async for packet in self.recv():
+            log.debug(f"Received rtcp: {packet}")
+            pcm = self.decoders[packet.ssrc].decode(packet)
+            if pcm:
+                user = self._get_user(packet.ssrc)
+                yield VoiceData(pcm, user, packet)
+
+    async def recv(self):
         loop = asyncio.get_running_loop()
         while True:
             try:
@@ -234,43 +236,24 @@ class AudioReader:
                     continue
                 else:
                     raise
-
-            try:
-                if not rtp.is_rtcp(raw_data):
-                    packet = rtp.decode(raw_data)
-                    packet.decrypted_data = self.decrypt_rtp(packet)
-                else:
-                    packet = rtp.decode(self.decrypt_rtcp(raw_data))
-                    log.debug(f"Received rtcp: {packet}")
-                    if not isinstance(packet, rtp.ReceiverReportPacket):
-                        log.warning(f"Not a ReceiverReportPacket: {packet}")
-                        # TODO: Fabricate and send SenderReports and see what happens
-                    continue
-
-            except CryptoError:
-                log.exception("CryptoError decoding packet %s", raw_data)
-                continue
-
-            except Exception as exc:
-                log.exception(f"Error unpacking packet: {exc}")
-
             else:
-                pcm = self.decoders[packet.ssrc].decode(packet)
-                if pcm:
-                    self.feed(packet, pcm)
+                try:
+                    if rtp.is_rtcp(raw_data):
+                        packet = rtp.decode(self.decrypt_rtcp(raw_data))
+                        if not isinstance(packet, rtp.ReceiverReportPacket):
+                            log.warning(f"Not a ReceiverReportPacket: {packet}")
+                        # TODO: Fabricate and send SenderReports and see what happens
+                        continue
+                    else:
+                        packet = rtp.decode(raw_data)
+                        packet.decrypted_data = self.decrypt_rtp(packet)
+                except CryptoError:
+                    log.exception("CryptoError decoding packet %s", raw_data)
 
-    async def run(self):
-        try:
-            await self._do_run()
-        except Exception as exc:
-            log.exception(f"Exception in _do_run(): {exc}")
-            raise
-        finally:
-            self._stop_decoders()
-            try:
-                await self.sink.cleanup()
-            except Exception as exc:
-                log.exception(f"Error during sink cleanup: {exc}")
+                except Exception as exc:
+                    log.exception(f"Error unpacking packet: {exc}")
+                else:
+                    yield packet
 
     def is_listening(self):
         return not self._end.is_set()
