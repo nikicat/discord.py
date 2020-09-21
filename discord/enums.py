@@ -203,18 +203,6 @@ class VoiceRegion(Enum):
     def __str__(self):
         return self.value
 
-class SpeakingState(Enum):
-    none       = 0
-    voice      = 1
-    soundshare = 2
-    priority   = 4
-
-    def __str__(self):
-        return self.name
-
-    def __int__(self):
-        return self.value
-
 class VerificationLevel(Enum):
     none              = 0
     low               = 1

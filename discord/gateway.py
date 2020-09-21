@@ -41,7 +41,6 @@ import aiohttp
 from . import utils
 from .activity import BaseActivity
 from .speakingstate import SpeakingState
-from .enums import SpeakingState
 from .errors import ConnectionClosed, InvalidArgument
 
 log = logging.getLogger(__name__)

@@ -452,15 +452,6 @@ class VoiceClient:
 
     # send api related
 
-    def _encrypt_xsalsa20_poly1305_lite(self, header, data):
-        box = nacl.secret.SecretBox(bytes(self.secret_key))
-        nonce = bytearray(24)
-
-        nonce[:4] = struct.pack('>I', self._lite_nonce)
-        self.checked_add('_lite_nonce', 1, 4294967295)
-
-        return header + box.encrypt(bytes(data), bytes(nonce)).ciphertext + nonce[:4]
-
     def play(self, source, *, after=None):
         """Plays an :class:`AudioSource`.
 
