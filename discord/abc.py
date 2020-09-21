@@ -3,7 +3,7 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2019 Rapptz
+Copyright (c) 2015-2020 Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -27,10 +27,10 @@ DEALINGS IN THE SOFTWARE.
 import abc
 import copy
 import asyncio
-from collections import namedtuple
 
 from .iterators import HistoryIterator
 from .context_managers import Typing
+from .enums import ChannelType
 from .errors import InvalidArgument, ClientException, HTTPException
 from .permissions import PermissionOverwrite, Permissions
 from .role import Role
@@ -51,7 +51,7 @@ class Snowflake(metaclass=abc.ABCMeta):
     abstract base class.
 
     If you want to create a snowflake on your own, consider using
-    :class:`Object`.
+    :class:`.Object`.
 
     Attributes
     -----------
@@ -161,7 +161,22 @@ class PrivateChannel(metaclass=abc.ABCMeta):
             return NotImplemented
         return NotImplemented
 
-_Overwrites = namedtuple('_Overwrites', 'id allow deny type')
+class _Overwrites:
+    __slots__ = ('id', 'allow', 'deny', 'type')
+
+    def __init__(self, **kwargs):
+        self.id = kwargs.pop('id')
+        self.allow = kwargs.pop('allow', 0)
+        self.deny = kwargs.pop('deny', 0)
+        self.type = kwargs.pop('type')
+
+    def _asdict(self):
+        return {
+            'id': self.id,
+            'allow': self.allow,
+            'deny': self.deny,
+            'type': self.type,
+        }
 
 class GuildChannel:
     """An ABC that details the common operations on a Discord guild channel.
@@ -201,9 +216,6 @@ class GuildChannel:
         bucket = self._sorting_bucket
         channels = [c for c in self.guild.channels if c._sorting_bucket == bucket]
 
-        if position >= len(channels):
-            raise InvalidArgument('Channel position cannot be greater than {}'.format(len(channels) - 1))
-
         channels.sort(key=lambda c: c.position)
 
         try:
@@ -213,8 +225,9 @@ class GuildChannel:
             # not there somehow lol
             return
         else:
+            index = next((i for i, c in enumerate(channels) if c.position >= position), -1)
             # add ourselves at our designated position
-            channels.insert(position, self)
+            channels.insert(index, self)
 
         payload = []
         for index, c in enumerate(channels):
@@ -260,7 +273,7 @@ class GuildChannel:
             await self._move(position, parent_id=parent_id, lock_permissions=lock_permissions, reason=reason)
 
         overwrites = options.get('overwrites', None)
-        if overwrites:
+        if overwrites is not None:
             perms = []
             for target, perm in overwrites.items():
                 if not isinstance(perm, PermissionOverwrite):
@@ -280,6 +293,15 @@ class GuildChannel:
 
                 perms.append(payload)
             options['permission_overwrites'] = perms
+
+        try:
+            ch_type = options['type']
+        except KeyError:
+            pass
+        else:
+            if not isinstance(ch_type, ChannelType):
+                raise InvalidArgument('type field must be of type ChannelType')
+            options['type'] = ch_type.value
 
         if options:
             data = await self._state.http.edit_channel(self.id, reason=reason, **options)
@@ -417,7 +439,7 @@ class GuildChannel:
         .. versionadded:: 1.3
         """
         category = self.guild.get_channel(self.category_id)
-        return bool(category and category._overwrites == self._overwrites)
+        return bool(category and category.overwrites == self.overwrites)
 
     def permissions_for(self, member):
         """Handles permission resolution for the current :class:`~discord.Member`.
@@ -459,11 +481,14 @@ class GuildChannel:
 
         default = self.guild.default_role
         base = Permissions(default.permissions.value)
-        roles = member.roles
+        roles = member._roles
+        get_role = self.guild.get_role
 
         # Apply guild roles that the member has.
-        for role in roles:
-            base.value |= role.permissions.value
+        for role_id in roles:
+            role = get_role(role_id)
+            if role is not None:
+                base.value |= role._permissions
 
         # Guild-wide Administrator -> True for everything
         # Bypass all channel-specific overrides
@@ -481,19 +506,12 @@ class GuildChannel:
         except IndexError:
             remaining_overwrites = self._overwrites
 
-        # not sure if doing member._roles.get(...) is better than the
-        # set approach. While this is O(N) to re-create into a set for O(1)
-        # the direct approach would just be O(log n) for searching with no
-        # extra memory overhead. For now, I'll keep the set cast
-        # Note that the member.roles accessor up top also creates a
-        # temporary list
-        member_role_ids = {r.id for r in roles}
         denies = 0
         allows = 0
 
         # Apply channel specific role permission overwrites
         for overwrite in remaining_overwrites:
-            if overwrite.type == 'role' and overwrite.id in member_role_ids:
+            if overwrite.type == 'role' and roles.has(overwrite.id):
                 denies |= overwrite.deny
                 allows |= overwrite.allow
 
@@ -588,7 +606,7 @@ class GuildChannel:
         target: Union[:class:`~discord.Member`, :class:`~discord.Role`]
             The member or role to overwrite permissions for.
         overwrite: Optional[:class:`~discord.PermissionOverwrite`]
-            The permissions to allow and deny to the target, or `None` to
+            The permissions to allow and deny to the target, or ``None`` to
             delete the overwrite.
         \*\*permissions
             A keyword argument list of permissions to set for ease of use.
@@ -660,7 +678,10 @@ class GuildChannel:
         Clones this channel. This creates a channel with the same properties
         as this channel.
 
-        .. versionadded:: 1.1.0
+        You must have the :attr:`~discord.Permissions.manage_channels` permission to
+        do this.
+
+        .. versionadded:: 1.1
 
         Parameters
         ------------
@@ -690,11 +711,11 @@ class GuildChannel:
         Parameters
         ------------
         max_age: :class:`int`
-            How long the invite should last. If it's 0 then the invite
-            doesn't expire. Defaults to 0.
+            How long the invite should last in seconds. If it's 0 then the invite
+            doesn't expire. Defaults to ``0``.
         max_uses: :class:`int`
             How many uses the invite could be used for. If it's 0 then there
-            are unlimited uses. Defaults to 0.
+            are unlimited uses. Defaults to ``0``.
         temporary: :class:`bool`
             Denotes that the invite grants temporary membership
             (i.e. they get kicked after they disconnect). Defaults to ``False``.
@@ -769,7 +790,9 @@ class Messageable(metaclass=abc.ABCMeta):
     async def _get_channel(self):
         raise NotImplementedError
 
-    async def send(self, content=None, *, tts=False, embed=None, file=None, files=None, delete_after=None, nonce=None):
+    async def send(self, content=None, *, tts=False, embed=None, file=None,
+                                          files=None, delete_after=None, nonce=None,
+                                          allowed_mentions=None):
         """|coro|
 
         Sends a message to the destination with the content given.
@@ -805,6 +828,15 @@ class Messageable(metaclass=abc.ABCMeta):
             If provided, the number of seconds to wait in the background
             before deleting the message we just sent. If the deletion fails,
             then it is silently ignored.
+        allowed_mentions: :class:`~discord.AllowedMentions`
+            Controls the mentions being processed in this message. If this is
+            passed, then the object is merged with :attr:`~discord.Client.allowed_mentions`.
+            The merging behaviour only overrides attributes that have been explicitly passed
+            to the object, otherwise it uses the attributes set in :attr:`~discord.Client.allowed_mentions`.
+            If no object is passed at all then the defaults given by :attr:`~discord.Client.allowed_mentions`
+            are used instead.
+
+            .. versionadded:: 1.4
 
         Raises
         --------
@@ -828,6 +860,14 @@ class Messageable(metaclass=abc.ABCMeta):
         if embed is not None:
             embed = embed.to_dict()
 
+        if allowed_mentions is not None:
+            if state.allowed_mentions is not None:
+                allowed_mentions = state.allowed_mentions.merge(allowed_mentions).to_dict()
+            else:
+                allowed_mentions = allowed_mentions.to_dict()
+        else:
+            allowed_mentions = state.allowed_mentions and state.allowed_mentions.to_dict()
+
         if file is not None and files is not None:
             raise InvalidArgument('cannot pass both file and files parameter to send()')
 
@@ -836,7 +876,7 @@ class Messageable(metaclass=abc.ABCMeta):
                 raise InvalidArgument('file parameter must be File')
 
             try:
-                data = await state.http.send_files(channel.id, files=[file],
+                data = await state.http.send_files(channel.id, files=[file], allowed_mentions=allowed_mentions,
                                                    content=content, tts=tts, embed=embed, nonce=nonce)
             finally:
                 file.close()
@@ -849,12 +889,13 @@ class Messageable(metaclass=abc.ABCMeta):
 
             try:
                 data = await state.http.send_files(channel.id, files=files, content=content, tts=tts,
-                                                   embed=embed, nonce=nonce)
+                                                   embed=embed, nonce=nonce, allowed_mentions=allowed_mentions)
             finally:
                 for f in files:
                     f.close()
         else:
-            data = await state.http.send_message(channel.id, content, tts=tts, embed=embed, nonce=nonce)
+            data = await state.http.send_message(channel.id, content, tts=tts, embed=embed,
+                                                                      nonce=nonce, allowed_mentions=allowed_mentions)
 
         ret = state.create_message(channel=channel, data=data)
         if delete_after is not None:

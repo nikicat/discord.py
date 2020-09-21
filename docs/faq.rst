@@ -77,7 +77,7 @@ General
 General questions regarding library usage belong here.
 
 Where can I find usage examples?
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Example code can be found in the `examples folder <https://github.com/Rapptz/discord.py/tree/master/examples>`_
 in the repository.
@@ -321,7 +321,7 @@ Quick example: ::
 
     Due to a Discord limitation, filenames may not include underscores.
 
-Is there an event for invites or audit log entries being created?
+Is there an event for audit log entries being created?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Since Discord does not dispatch this information in the gateway, the library cannot provide this information.
@@ -343,6 +343,15 @@ Overriding the default provided ``on_message`` forbids any extra commands from r
         # do some extra stuff here
 
         await bot.process_commands(message)
+
+Alternatively, you can place your ``on_message`` logic into a **listener**. In this setup, you should not
+manually call ``bot.process_commands()``. This also allows you to do multiple things asynchronously in response
+to a message. Example::
+
+    @bot.listen('on_message')
+    async def whatever_you_want_to_call_it(message):
+        # do stuff here
+        # do not process commands here
 
 Why do my arguments require quotes?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

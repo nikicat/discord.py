@@ -3,7 +3,7 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2019 Rapptz
+Copyright (c) 2015-2020 Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -31,7 +31,6 @@ from pathlib import Path
 import discord
 import pkg_resources
 import aiohttp
-import websockets
 import platform
 
 def show_version():
@@ -46,7 +45,6 @@ def show_version():
             entries.append('    - discord.py pkg_resources: v{0}'.format(pkg.version))
 
     entries.append('- aiohttp v{0.__version__}'.format(aiohttp))
-    entries.append('- websockets v{0.__version__}'.format(websockets))
     uname = platform.uname()
     entries.append('- system info: {0.system} {0.release} {0.version}'.format(uname))
     print('\n'.join(entries))

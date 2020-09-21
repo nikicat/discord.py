@@ -3,7 +3,7 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2019 Rapptz
+Copyright (c) 2015-2020 Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -33,7 +33,7 @@ from . import utils
 from .user import BaseUser, User
 from .activity import create_activity
 from .permissions import Permissions
-from .enums import Status, try_enum
+from .enums import Status, try_enum, UserFlags, HypeSquadHouse
 from .colour import Colour
 from .object import Object
 
@@ -53,14 +53,14 @@ class VoiceState:
     self_stream: :class:`bool`
         Indicates if the user is currently streaming via 'Go Live' feature.
 
-        .. versionadded:: 1.3.0 
+        .. versionadded:: 1.3
 
     self_video: :class:`bool`
         Indicates if the user is currently broadcasting video.
     afk: :class:`bool`
         Indicates if the user is currently in the AFK channel in the guild.
     channel: Optional[:class:`VoiceChannel`]
-        The voice channel that the user is currently connected to. None if the user
+        The voice channel that the user is currently connected to. ``None`` if the user
         is not currently in a voice channel.
     """
 
@@ -148,9 +148,9 @@ class Member(discord.abc.Messageable, _BaseUser):
     Attributes
     ----------
     joined_at: Optional[:class:`datetime.datetime`]
-        A datetime object that specifies the date and time in UTC that the member joined the guild for
-        the first time. In certain cases, this can be ``None``.
-    activities: Tuple[Union[:class:`Game`, :class:`Streaming`, :class:`Spotify`, :class:`Activity`]]
+        A datetime object that specifies the date and time in UTC that the member joined the guild.
+        If the member left and rejoined the guild, this will be the latest date. In certain cases, this can be ``None``.
+    activities: Tuple[Union[:class:`BaseActivity`, :class:`Spotify`]]
         The activities that the user is currently doing.
     guild: :class:`Guild`
         The guild that the member belongs to.
@@ -161,7 +161,8 @@ class Member(discord.abc.Messageable, _BaseUser):
         Nitro boost on the guild, if available. This could be ``None``.
     """
 
-    __slots__ = ('_roles', 'joined_at', 'premium_since', '_client_status', 'activities', 'guild', 'nick', '_user', '_state')
+    __slots__ = ('_roles', 'joined_at', 'premium_since', '_client_status',
+                 'activities', 'guild', 'nick', '_user', '_state')
 
     def __init__(self, *, data, guild, state):
         self._state = state
@@ -197,6 +198,12 @@ class Member(discord.abc.Messageable, _BaseUser):
         author = message.author
         data['user'] = author._to_minimal_user_json()
         return cls(data=data, guild=message.guild, state=message._state)
+
+    def _update_from_message(self, data):
+        self.joined_at = utils.parse_time(data.get('joined_at'))
+        self.premium_since = utils.parse_time(data.get('premium_since'))
+        self._update_roles(data)
+        self.nick = data.get('nick', None)
 
     @classmethod
     def _try_upgrade(cls, *,  data, guild, state):
@@ -311,7 +318,7 @@ class Member(discord.abc.Messageable, _BaseUser):
         for the member. If the default colour is the one rendered then an instance
         of :meth:`Colour.default` is returned.
 
-        There is an alias for this named :meth:`color`.
+        There is an alias for this named :attr:`color`.
         """
 
         roles = self.roles[1:] # remove @everyone
@@ -330,7 +337,7 @@ class Member(discord.abc.Messageable, _BaseUser):
         the member. If the default color is the one rendered then an instance of :meth:`Colour.default`
         is returned.
 
-        There is an alias for this named :meth:`colour`.
+        There is an alias for this named :attr:`colour`.
         """
         return self.colour
 
@@ -371,8 +378,8 @@ class Member(discord.abc.Messageable, _BaseUser):
 
     @property
     def activity(self):
-        """Union[:class:`Game`, :class:`Streaming`, :class:`Spotify`, :class:`Activity`]: Returns the primary
-        activity the user is currently doing. Could be None if no activity is being done.
+        """Union[:class:`BaseActivity`, :class:`Spotify`]: Returns the primary
+        activity the user is currently doing. Could be ``None`` if no activity is being done.
 
         .. note::
 
@@ -389,12 +396,14 @@ class Member(discord.abc.Messageable, _BaseUser):
         message: :class:`Message`
             The message to check if you're mentioned in.
         """
+        if message.guild is None or message.guild.id != self.guild.id:
+            return False
+
         if self._user.mentioned_in(message):
             return True
 
         for role in message.role_mentions:
-            has_role = utils.get(self.roles, id=role.id) is not None
-            if has_role:
+            if self._roles.has(role.id):
                 return True
 
         return False
@@ -410,8 +419,13 @@ class Member(discord.abc.Messageable, _BaseUser):
 
         Parameters
         -----------
-        channel: :class:`Channel`
+        channel: :class:`abc.GuildChannel`
             The channel to check your permissions for.
+
+        Returns
+        -------
+        :class:`Permissions`
+            The resolved permissions for the member.
         """
         return channel.permissions_for(self)
 
@@ -422,11 +436,15 @@ class Member(discord.abc.Messageable, _BaseUser):
         This is useful for figuring where a member stands in the role
         hierarchy chain.
         """
-        return self.roles[-1]
+        guild = self.guild
+        if len(self._roles) == 0:
+            return guild.default_role
+
+        return max(guild.get_role(rid) or guild.default_role for rid in self._roles)
 
     @property
     def guild_permissions(self):
-        """Returns the member's guild permissions.
+        """:class:`Permissions`: Returns the member's guild permissions.
 
         This only takes into consideration the guild permissions
         and not most of the implied permissions or any of the
@@ -499,7 +517,7 @@ class Member(discord.abc.Messageable, _BaseUser):
 
         All parameters are optional.
 
-        .. versionchanged:: 1.1.0
+        .. versionchanged:: 1.1
             Can now pass ``None`` to ``voice_channel`` to kick a member from voice.
 
         Parameters
@@ -577,7 +595,7 @@ class Member(discord.abc.Messageable, _BaseUser):
 
         This raises the same exceptions as :meth:`edit`.
 
-        .. versionchanged:: 1.1.0
+        .. versionchanged:: 1.1
             Can now pass ``None`` to kick a member from voice.
 
         Parameters

@@ -3,7 +3,7 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2019 Rapptz
+Copyright (c) 2015-2020 Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -49,6 +49,8 @@ __all__ = (
     'TeamMembershipState',
     'Theme',
     'WebhookType',
+    'ExpireBehaviour',
+    'ExpireBehavior'
 )
 
 def _create_value_cls(name):
@@ -190,8 +192,10 @@ class VoiceRegion(Enum):
     russia        = 'russia'
     japan         = 'japan'
     southafrica   = 'southafrica'
+    south_korea   = 'south-korea'
     india         = 'india'
     europe        = 'europe'
+    dubai         = 'dubai'
     vip_us_east   = 'vip-us-east'
     vip_us_west   = 'vip-us-west'
     vip_amsterdam = 'vip-amsterdam'
@@ -219,6 +223,7 @@ class VerificationLevel(Enum):
     table_flip        = 3
     extreme           = 4
     double_table_flip = 4
+    very_high         = 4
 
     def __str__(self):
         return self.name
@@ -357,7 +362,7 @@ class AuditLogAction(Enum):
             AuditLogAction.message_pin:         None,
             AuditLogAction.message_unpin:       None,
             AuditLogAction.integration_create:  AuditLogActionCategory.create,
-            AuditLogAction.integration_update:  AuditLogActionCategoty.update,
+            AuditLogAction.integration_update:  AuditLogActionCategory.update,
             AuditLogAction.integration_delete:  AuditLogActionCategory.delete,
         }
         return lookup[self]
@@ -391,10 +396,18 @@ class UserFlags(Enum):
     partner = 2
     hypesquad = 4
     bug_hunter = 8
+    mfa_sms = 16
+    premium_promo_dismissed = 32
     hypesquad_bravery = 64
     hypesquad_brilliance = 128
     hypesquad_balance = 256
     early_supporter = 512
+    team_user = 1024
+    system = 4096
+    has_unread_urgent_messages = 8192
+    bug_hunter_level_2 = 16384
+    verified_bot = 65536
+    verified_bot_developer = 131072
 
 class ActivityType(Enum):
     unknown = -1
@@ -402,6 +415,8 @@ class ActivityType(Enum):
     streaming = 1
     listening = 2
     watching = 3
+    custom = 4
+    competing = 5
 
     def __int__(self):
         return self.value
@@ -422,6 +437,12 @@ class TeamMembershipState(Enum):
 class WebhookType(Enum):
     incoming = 1
     channel_follower = 2
+
+class ExpireBehaviour(Enum):
+    remove_role = 0
+    kick = 1
+
+ExpireBehavior = ExpireBehaviour
 
 def try_enum(cls, val):
     """A function that tries to turn the value into enum ``cls``.

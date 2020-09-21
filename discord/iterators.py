@@ -3,7 +3,7 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2019 Rapptz
+Copyright (c) 2015-2020 Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -157,7 +157,7 @@ class ReactionIterator(_AsyncIterator):
                 self.limit -= retrieve
                 self.after = Object(id=int(data[-1]['id']))
 
-            if self.guild is None:
+            if self.guild is None or isinstance(self.guild, Object):
                 for element in reversed(data):
                     await self.users.put(User(state=self.state, data=element))
             else:
@@ -173,16 +173,16 @@ class HistoryIterator(_AsyncIterator):
     """Iterator for receiving a channel's message history.
 
     The messages endpoint has two behaviours we care about here:
-    If `before` is specified, the messages endpoint returns the `limit`
-    newest messages before `before`, sorted with newest first. For filling over
-    100 messages, update the `before` parameter to the oldest message received.
+    If ``before`` is specified, the messages endpoint returns the `limit`
+    newest messages before ``before``, sorted with newest first. For filling over
+    100 messages, update the ``before`` parameter to the oldest message received.
     Messages will be returned in order by time.
-    If `after` is specified, it returns the `limit` oldest messages after
-    `after`, sorted with newest first. For filling over 100 messages, update the
-    `after` parameter to the newest message received. If messages are not
+    If ``after`` is specified, it returns the ``limit`` oldest messages after
+    ``after``, sorted with newest first. For filling over 100 messages, update the
+    ``after`` parameter to the newest message received. If messages are not
     reversed, they will be out of order (99-0, 199-100, so on)
 
-    A note that if both before and after are specified, before is ignored by the
+    A note that if both ``before`` and ``after`` are specified, ``before`` is ignored by the
     messages endpoint.
 
     Parameters
@@ -200,7 +200,7 @@ class HistoryIterator(_AsyncIterator):
         limit is an even number, this will return at most limit+1 messages.
     oldest_first: Optional[:class:`bool`]
         If set to ``True``, return messages in oldest->newest order. Defaults to
-        True if ``after`` is specified, otherwise ``False``.
+        ``True`` if `after` is specified, otherwise ``False``.
     """
 
     def __init__(self, messageable, limit,
@@ -237,8 +237,6 @@ class HistoryIterator(_AsyncIterator):
                 raise ValueError("history max limit 101 when specifying around parameter")
             elif self.limit == 101:
                 self.limit = 100  # Thanks discord
-            elif self.limit == 1:
-                raise ValueError("Use fetch_message.")
 
             self._retrieve_messages = self._retrieve_messages_around_strategy
             if self.before and self.after:
@@ -464,16 +462,16 @@ class GuildIterator(_AsyncIterator):
 
     The guilds endpoint has the same two behaviours as described
     in :class:`HistoryIterator`:
-    If `before` is specified, the guilds endpoint returns the `limit`
-    newest guilds before `before`, sorted with newest first. For filling over
-    100 guilds, update the `before` parameter to the oldest guild received.
+    If ``before`` is specified, the guilds endpoint returns the ``limit``
+    newest guilds before ``before``, sorted with newest first. For filling over
+    100 guilds, update the ``before`` parameter to the oldest guild received.
     Guilds will be returned in order by time.
-    If `after` is specified, it returns the `limit` oldest guilds after `after`,
-    sorted with newest first. For filling over 100 guilds, update the `after`
+    If `after` is specified, it returns the ``limit`` oldest guilds after ``after``,
+    sorted with newest first. For filling over 100 guilds, update the ``after``
     parameter to the newest guild received, If guilds are not reversed, they
     will be out of order (99-0, 199-100, so on)
 
-    Not that if both before and after are specified, before is ignored by the
+    Not that if both ``before`` and ``after`` are specified, ``before`` is ignored by the
     guilds endpoint.
 
     Parameters
@@ -589,7 +587,7 @@ class GuildIterator(_AsyncIterator):
         return data
 
 class MemberIterator(_AsyncIterator):
-    def __init__(self, guild, limit=1, after=None):
+    def __init__(self, guild, limit=1000, after=None):
 
         if isinstance(after, datetime.datetime):
             after = Object(id=time_snowflake(after, high=True))
@@ -611,16 +609,30 @@ class MemberIterator(_AsyncIterator):
         except asyncio.QueueEmpty:
             raise NoMoreItems()
 
+    def _get_retrieve(self):
+        l = self.limit
+        if l is None:
+            r = 1000
+        elif l <= 1000:
+            r = l
+        else:
+            r = 1000
+
+        self.retrieve = r
+        return r > 0
+
     async def fill_members(self):
-        if self.limit > 0:
-            retrieve = self.limit if self.limit <= 1000 else 1000
-
+        if self._get_retrieve():
             after = self.after.id if self.after else None
-            data = await self.get_members(self.guild.id, retrieve, after)
+            data = await self.get_members(self.guild.id, self.retrieve, after)
+            if not data:
+                # no data, terminate
+                return
 
-            if data:
-                self.limit -= retrieve
-                self.after = Object(id=int(data[-1]['user']['id']))
+            if len(data) < 1000:
+                self.limit = 0 # terminate loop
+
+            self.after = Object(id=int(data[-1]['user']['id']))
 
             for element in reversed(data):
                 await self.members.put(self.create_member(element))

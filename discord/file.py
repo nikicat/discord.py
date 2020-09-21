@@ -3,7 +3,7 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2019 Rapptz
+Copyright (c) 2015-2020 Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -30,6 +30,11 @@ import io
 class File:
     """A parameter object used for :meth:`abc.Messageable.send`
     for sending file objects.
+
+    .. note::
+
+        File objects are single use and are not meant to be reused in
+        multiple :meth:`abc.Messageable.send`\s.
 
     Attributes
     -----------

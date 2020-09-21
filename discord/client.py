@@ -3,7 +3,7 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2019 Rapptz
+Copyright (c) 2015-2020 Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -25,27 +25,27 @@ DEALINGS IN THE SOFTWARE.
 """
 
 import asyncio
-from collections import namedtuple
 import logging
 import signal
 import sys
 import traceback
 
 import aiohttp
-import websockets
 
 from .user import User, Profile
 from .asset import Asset
 from .invite import Invite
+from .template import Template
 from .widget import Widget
 from .guild import Guild
 from .channel import _channel_factory
 from .enums import ChannelType
 from .member import Member
+from .mentions import AllowedMentions
 from .errors import *
 from .enums import Status, VoiceRegion
 from .gateway import *
-from .activity import _ActivityTag, create_activity
+from .activity import BaseActivity, create_activity
 from .voice_client import VoiceClient
 from .http import HTTPClient
 from .state import ConnectionState
@@ -122,10 +122,10 @@ class Client:
     -----------
     max_messages: Optional[:class:`int`]
         The maximum number of messages to store in the internal message cache.
-        This defaults to 1000. Passing in ``None`` disables the message cache.
+        This defaults to ``1000``. Passing in ``None`` disables the message cache.
 
         .. versionchanged:: 1.3
-            Allow disabling the message cache and change the default size to 1000.
+            Allow disabling the message cache and change the default size to ``1000``.
     loop: Optional[:class:`asyncio.AbstractEventLoop`]
         The :class:`asyncio.AbstractEventLoop` to use for asynchronous operations.
         Defaults to ``None``, in which case the default event loop is used via
@@ -137,25 +137,34 @@ class Client:
     proxy_auth: Optional[:class:`aiohttp.BasicAuth`]
         An object that represents proxy HTTP Basic Authorization.
     shard_id: Optional[:class:`int`]
-        Integer starting at 0 and less than :attr:`.shard_count`.
+        Integer starting at ``0`` and less than :attr:`.shard_count`.
     shard_count: Optional[:class:`int`]
         The total number of shards.
     fetch_offline_members: :class:`bool`
         Indicates if :func:`.on_ready` should be delayed to fetch all offline
-        members from the guilds the bot belongs to. If this is ``False``\, then
+        members from the guilds the client belongs to. If this is ``False``\, then
         no offline members are received and :meth:`request_offline_members`
         must be used to fetch the offline members of the guild.
     status: Optional[:class:`.Status`]
         A status to start your presence with upon logging on to Discord.
-    activity: Optional[Union[:class:`.Activity`, :class:`.Game`, :class:`.Streaming`]]
+    activity: Optional[:class:`.BaseActivity`]
         An activity to start your presence with upon logging on to Discord.
+    allowed_mentions: Optional[:class:`AllowedMentions`]
+        Control how the client handles mentions by default on every message sent.
+
+        .. versionadded:: 1.4
     heartbeat_timeout: :class:`float`
         The maximum numbers of seconds before timing out and restarting the
         WebSocket in the case of not receiving a HEARTBEAT_ACK. Useful if
         processing the initial packets take too long to the point of disconnecting
         you. The default timeout is 60 seconds.
+    guild_ready_timeout: :class:`float`
+        The maximum number of seconds to wait for the GUILD_CREATE stream to end before
+        preparing the member cache and firing READY. The default timeout is 2 seconds.
+
+        .. versionadded:: 1.4
     guild_subscriptions: :class:`bool`
-        Whether to dispatching of presence or typing events. Defaults to ``True``.
+        Whether to dispatch presence or typing events. Defaults to ``True``.
 
         .. versionadded:: 1.3
 
@@ -169,7 +178,7 @@ class Client:
                     - :func:`on_member_join`
                     - :func:`on_member_remove`
 
-                - Typing events will be disabled (:func:`on_typing_start`).
+                - Typing events will be disabled (:func:`on_typing`).
                 - If ``fetch_offline_members`` is set to ``False`` then the user cache will not exist.
                   This makes it difficult or impossible to do many things, for example:
 
@@ -218,13 +227,17 @@ class Client:
             'ready': self._handle_ready
         }
 
-        self._connection = ConnectionState(dispatch=self.dispatch, chunker=self._chunker, handlers=self._handlers,
-                                           syncer=self._syncer, http=self.http, loop=self.loop, **options)
+        self._hooks = {
+            'before_identify': self._call_before_identify_hook
+        }
+
+        self._connection = ConnectionState(dispatch=self.dispatch, handlers=self._handlers,
+                                           hooks=self._hooks, syncer=self._syncer, http=self.http, loop=self.loop, **options)
 
         self._connection.shard_count = self.shard_count
         self._closed = False
         self._ready = asyncio.Event()
-        self._connection._get_websocket = lambda g: self.ws
+        self._connection._get_websocket = self._get_websocket
 
         if VoiceClient.warn_nacl:
             VoiceClient.warn_nacl = False
@@ -232,25 +245,11 @@ class Client:
 
     # internals
 
+    def _get_websocket(self, guild_id=None, *, shard_id=None):
+        return self.ws
+
     async def _syncer(self, guilds):
         await self.ws.request_sync(guilds)
-
-    async def _chunker(self, guild):
-        try:
-            guild_id = guild.id
-        except AttributeError:
-            guild_id = [s.id for s in guild]
-
-        payload = {
-            'op': 8,
-            'd': {
-                'guild_id': guild_id,
-                'query': '',
-                'limit': 0
-            }
-        }
-
-        await self.ws.send_as_json(payload)
 
     def _handle_ready(self):
         self._ready.set()
@@ -266,7 +265,7 @@ class Client:
 
     @property
     def user(self):
-        """Optional[:class:`.ClientUser`]: Represents the connected client. None if not logged in."""
+        """Optional[:class:`.ClientUser`]: Represents the connected client. ``None`` if not logged in."""
         return self._connection.user
 
     @property
@@ -283,7 +282,7 @@ class Client:
     def cached_messages(self):
         """Sequence[:class:`.Message`]: Read-only list of messages the connected client has cached.
 
-        .. versionadded:: 1.1.0
+        .. versionadded:: 1.1
         """
         return utils.SequenceProxy(self._connection._messages or [])
 
@@ -403,6 +402,36 @@ class Client:
 
         await self._connection.request_offline_members(guilds)
 
+    # hooks
+
+    async def _call_before_identify_hook(self, shard_id, *, initial=False):
+        # This hook is an internal hook that actually calls the public one.
+        # It allows the library to have its own hook without stepping on the
+        # toes of those who need to override their own hook.
+        await self.before_identify_hook(shard_id, initial=initial)
+
+    async def before_identify_hook(self, shard_id, *, initial=False):
+        """|coro|
+
+        A hook that is called before IDENTIFYing a session. This is useful
+        if you wish to have more control over the synchronization of multiple
+        IDENTIFYing clients.
+
+        The default implementation sleeps for 5 seconds.
+
+        .. versionadded:: 1.4
+
+        Parameters
+        ------------
+        shard_id: :class:`int`
+            The shard ID that requested being IDENTIFY'd
+        initial: :class:`bool`
+            Whether this IDENTIFY is the first initial IDENTIFY.
+        """
+
+        if not initial:
+            await asyncio.sleep(5.0)
+
     # login state management
 
     async def login(self, token, *, bot=True):
@@ -415,7 +444,7 @@ class Client:
         .. warning::
 
             Logging on with a user token is against the Discord
-            `Terms of Service <https://support.discordapp.com/hc/en-us/articles/115002192352>`_
+            `Terms of Service <https://support.discord.com/hc/en-us/articles/115002192352>`_
             and doing so might potentially get your account banned.
             Use this at your own risk.
 
@@ -455,19 +484,6 @@ class Client:
         """
         await self.close()
 
-    async def _connect(self):
-        coro = DiscordWebSocket.from_client(self, shard_id=self.shard_id)
-        self.ws = await asyncio.wait_for(coro, timeout=180.0)
-        while True:
-            try:
-                await self.ws.poll_event()
-            except ResumeWebSocket:
-                log.info('Got a request to RESUME the websocket.')
-                self.dispatch('disconnect')
-                coro = DiscordWebSocket.from_client(self, shard_id=self.shard_id, session=self.ws.session_id,
-                                                    sequence=self.ws.sequence, resume=True)
-                self.ws = await asyncio.wait_for(coro, timeout=180.0)
-
     async def connect(self, *, reconnect=True):
         """|coro|
 
@@ -494,17 +510,28 @@ class Client:
         """
 
         backoff = ExponentialBackoff()
+        ws_params = {
+            'initial': True,
+            'shard_id': self.shard_id,
+        }
         while not self.is_closed():
             try:
-                await self._connect()
+                coro = DiscordWebSocket.from_client(self, **ws_params)
+                self.ws = await asyncio.wait_for(coro, timeout=60.0)
+                ws_params['initial'] = False
+                while True:
+                    await self.ws.poll_event()
+            except ReconnectWebSocket as e:
+                log.info('Got a request to %s the websocket.', e.op)
+                self.dispatch('disconnect')
+                ws_params.update(sequence=self.ws.sequence, resume=e.resume, session=self.ws.session_id)
+                continue
             except (OSError,
                     HTTPException,
                     GatewayNotFound,
                     ConnectionClosed,
                     aiohttp.ClientError,
-                    asyncio.TimeoutError,
-                    websockets.InvalidHandshake,
-                    websockets.WebSocketProtocolError) as exc:
+                    asyncio.TimeoutError) as exc:
 
                 self.dispatch('disconnect')
                 if not reconnect:
@@ -516,6 +543,11 @@ class Client:
 
                 if self.is_closed():
                     return
+
+                # If we get connection reset by peer then try to RESUME
+                if isinstance(exc, OSError) and exc.errno in (54, 10054):
+                    ws_params.update(sequence=self.ws.sequence, initial=False, resume=True, session=self.ws.session_id)
+                    continue
 
                 # We should only get this when an unhandled close code happens,
                 # such as a clean disconnect (1000) or a bad state (bad token, no sharding, etc)
@@ -529,6 +561,10 @@ class Client:
                 retry = backoff.delay()
                 log.exception("Attempting a reconnect in %.2fs", retry)
                 await asyncio.sleep(retry)
+                # Always try to RESUME the connection
+                # If the connection is not RESUME-able then the gateway will invalidate the session.
+                # This is apparently what the official Discord client does.
+                ws_params.update(sequence=self.ws.sequence, resume=True, session=self.ws.session_id)
 
     async def close(self):
         """|coro|
@@ -549,7 +585,7 @@ class Client:
                 pass
 
         if self.ws is not None and self.ws.open:
-            await self.ws.close()
+            await self.ws.close(code=1000)
 
         self._ready.clear()
 
@@ -620,7 +656,8 @@ class Client:
             try:
                 await self.start(*args, **kwargs)
             finally:
-                await self.close()
+                if not self.is_closed():
+                    await self.close()
 
         def stop_loop_on_completion(f):
             loop.stop()
@@ -637,7 +674,11 @@ class Client:
             _cleanup_loop(loop)
 
         if not future.cancelled():
-            return future.result()
+            try:
+                return future.result()
+            except KeyboardInterrupt:
+                # I am unsure why this gets raised here but suppress it anyway
+                return None
 
     # properties
 
@@ -647,7 +688,7 @@ class Client:
 
     @property
     def activity(self):
-        """Optional[Union[:class:`.Activity`, :class:`.Game`, :class:`.Streaming`]]: The activity being used upon
+        """Optional[:class:`.BaseActivity`]: The activity being used upon
         logging in.
         """
         return create_activity(self._connection._activity)
@@ -656,10 +697,27 @@ class Client:
     def activity(self, value):
         if value is None:
             self._connection._activity = None
-        elif isinstance(value, _ActivityTag):
+        elif isinstance(value, BaseActivity):
             self._connection._activity = value.to_dict()
         else:
-            raise TypeError('activity must be one of Game, Streaming, or Activity.')
+            raise TypeError('activity must derive from BaseActivity.')
+
+    @property
+    def allowed_mentions(self):
+        """Optional[:class:`~discord.AllowedMentions`]: The allowed mention configuration.
+
+        .. versionadded:: 1.4
+        """
+        return self._connection.allowed_mentions
+
+    @allowed_mentions.setter
+    def allowed_mentions(self, value):
+        if value is None:
+            self._connection.allowed_mentions = value
+        elif isinstance(value, AllowedMentions):
+            self._connection.allowed_mentions = value
+        else:
+            raise TypeError('allowed_mentions must be AllowedMentions not {0.__class__!r}'.format(value))
 
     # helpers/getters
 
@@ -904,10 +962,6 @@ class Client:
 
         Changes the client's presence.
 
-        The activity parameter is a :class:`.Activity` object (not a string) that represents
-        the activity being done currently. This could also be the slimmed down versions,
-        :class:`.Game` and :class:`.Streaming`.
-
         Example
         ---------
 
@@ -918,7 +972,7 @@ class Client:
 
         Parameters
         ----------
-        activity: Optional[Union[:class:`.Game`, :class:`.Streaming`, :class:`.Activity`]]
+        activity: Optional[:class:`.BaseActivity`]
             The activity being done. ``None`` if no currently active activity is done.
         status: Optional[:class:`.Status`]
             Indicates what status to change to. If ``None``, then
@@ -951,7 +1005,11 @@ class Client:
             if me is None:
                 continue
 
-            me.activities = (activity,)
+            if activity is not None:
+                me.activities = (activity,)
+            else:
+                me.activities = ()
+
             me.status = status_enum
 
     # Guild stuff
@@ -991,7 +1049,7 @@ class Client:
             The number of guilds to retrieve.
             If ``None``, it retrieves every guild you have access to. Note, however,
             that this would make it a slow operation.
-            Defaults to 100.
+            Defaults to ``100``.
         before: Union[:class:`.abc.Snowflake`, :class:`datetime.datetime`]
             Retrieves guilds before this date or object.
             If a date is provided it must be a timezone-naive datetime representing UTC time.
@@ -1010,6 +1068,32 @@ class Client:
             The guild with the guild data parsed.
         """
         return GuildIterator(self, limit=limit, before=before, after=after)
+
+    async def fetch_template(self, code):
+        """|coro|
+
+        Gets a :class:`.Template` from a discord.new URL or code.
+
+        Parameters
+        -----------
+        code: Union[:class:`.Template`, :class:`str`]
+            The Discord Template Code or URL (must be a discord.new URL).
+
+        Raises
+        -------
+        :exc:`.NotFound`
+            The template is invalid.
+        :exc:`.HTTPException`
+            Getting the template failed.
+
+        Returns
+        --------
+        :class:`.Template`
+            The template from the URL/code.
+        """
+        code = utils.resolve_template(code)
+        data = await self.http.get_template(code)
+        return Template(data=data, state=self._connection)
 
     async def fetch_guild(self, guild_id):
         """|coro|
@@ -1045,7 +1129,7 @@ class Client:
         data = await self.http.get_guild(guild_id)
         return Guild(data=data, state=self._connection)
 
-    async def create_guild(self, name, region=None, icon=None):
+    async def create_guild(self, name, region=None, icon=None, *, code=None):
         """|coro|
 
         Creates a :class:`.Guild`.
@@ -1062,6 +1146,10 @@ class Client:
         icon: :class:`bytes`
             The :term:`py:bytes-like object` representing the icon. See :meth:`.ClientUser.edit`
             for more details on what is expected.
+        code: Optional[:class:`str`]
+            The code for a template to create the guild with.
+
+            .. versionadded:: 1.4
 
         Raises
         ------
@@ -1084,7 +1172,10 @@ class Client:
         else:
             region = region.value
 
-        data = await self.http.create_guild(name, region, icon)
+        if code:
+            data = await self.http.create_from_template(code, name, region, icon)
+        else:
+            data = await self.http.create_guild(name, region, icon)
         return Guild(data=data, state=self._connection)
 
     # Invite management
@@ -1098,11 +1189,11 @@ class Client:
 
             If the invite is for a guild you have not joined, the guild and channel
             attributes of the returned :class:`.Invite` will be :class:`.PartialInviteGuild` and
-            :class:`PartialInviteChannel` respectively.
+            :class:`.PartialInviteChannel` respectively.
 
         Parameters
         -----------
-        url: :class:`str`
+        url: Union[:class:`.Invite`, :class:`str`]
             The Discord invite ID or URL (must be a discord.gg URL).
         with_counts: :class:`bool`
             Whether to include count information in the invite. This fills the
@@ -1287,7 +1378,7 @@ class Client:
 
             This method is an API call. For general usage, consider :meth:`get_channel` instead.
 
-        .. versionadded:: 1.2.0
+        .. versionadded:: 1.2
 
         Raises
         -------

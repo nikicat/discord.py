@@ -1,7 +1,7 @@
 discord.py
 ==========
 
-.. image:: https://discordapp.com/api/guilds/336642139381301249/embed.png
+.. image:: https://discord.com/api/guilds/336642139381301249/embed.png
    :target: https://discord.gg/nXzj3dg
    :alt: Discordサーバーの招待
 .. image:: https://img.shields.io/pypi/v/discord.py.svg
@@ -61,7 +61,7 @@ discord.py は機能豊富かつモダンで使いやすい、非同期処理に
 
 * PyNaCl (音声サポート用)
 
-Linuxで音声サポートを導入するには、前述のコマンドを実行する前にお気に入りのパッケージマネージャー(例えば ``apt`` や ``yum`` など)を使って以下のパッケージをインストールする必要があります:
+Linuxで音声サポートを導入するには、前述のコマンドを実行する前にお気に入りのパッケージマネージャー(例えば ``apt`` や ``dnf`` など)を使って以下のパッケージをインストールする必要があります:
 
 * libffi-dev (システムによっては ``libffi-devel``)
 * python-dev (例えばPython 3.6用の ``python3.6-dev``)

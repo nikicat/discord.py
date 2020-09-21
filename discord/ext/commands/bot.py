@@ -3,7 +3,7 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2019 Rapptz
+Copyright (c) 2015-2020 Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -215,7 +215,7 @@ class BotBase(GroupMixin):
             The function that was used as a global check.
         call_once: :class:`bool`
             If the function should only be called once per
-            :meth:`Command.invoke` call.
+            :meth:`.Command.invoke` call.
         """
 
         if call_once:
@@ -248,12 +248,18 @@ class BotBase(GroupMixin):
         r"""A decorator that adds a "call once" global check to the bot.
 
         Unlike regular global checks, this one is called only once
-        per :meth:`Command.invoke` call.
+        per :meth:`.Command.invoke` call.
 
         Regular global checks are called whenever a command is called
         or :meth:`.Command.can_run` is called. This type of check
         bypasses that and ensures that it's called only once, even inside
         the default help command.
+
+        .. note::
+
+            When using this function the :class:`.Context` sent to a group subcommand
+            may only parse the parent command and not the subcommands due to it
+            being invoked once per :meth:`.Bot.invoke` call.
 
         .. note::
 
@@ -293,8 +299,9 @@ class BotBase(GroupMixin):
         If an :attr:`owner_id` is not set, it is fetched automatically
         through the use of :meth:`~.Bot.application_info`.
 
-        The function also checks if the application is team-owned if
-        :attr:`owner_ids` is not set.
+        .. versionchanged:: 1.3
+            The function also checks if the application is team-owned if
+            :attr:`owner_ids` is not set.
 
         Parameters
         -----------
@@ -512,6 +519,11 @@ class BotBase(GroupMixin):
             The name of the cog you are requesting.
             This is equivalent to the name passed via keyword
             argument in class creation or the class name if unspecified.
+
+        Returns
+        --------
+        Optional[:class:`Cog`]
+            The cog that was requested. If not found, returns ``None``.
         """
         return self.__cogs.get(name)
 
@@ -791,7 +803,7 @@ class BotBase(GroupMixin):
             except TypeError:
                 # It's possible that a generator raised this exception.  Don't
                 # replace it with our own error if that's the case.
-                if isinstance(ret, collections.Iterable):
+                if isinstance(ret, collections.abc.Iterable):
                     raise
 
                 raise TypeError("command_prefix must be plain string, iterable of strings, or callable "
@@ -889,6 +901,8 @@ class BotBase(GroupMixin):
             try:
                 if await self.can_run(ctx, call_once=True):
                     await ctx.command.invoke(ctx)
+                else:
+                    raise errors.CheckFailure('The global check once functions failed.')
             except errors.CommandError as exc:
                 await ctx.command.dispatch_error(ctx, exc)
             else:
@@ -988,11 +1002,13 @@ class Bot(BotBase, discord.Client):
         :meth:`.is_owner` then it is fetched automatically using
         :meth:`~.Bot.application_info`.
     owner_ids: Optional[Collection[:class:`int`]]
-        The user IDs that owns the bot. This is similar to `owner_id`.
+        The user IDs that owns the bot. This is similar to :attr:`owner_id`.
         If this is not set and the application is team based, then it is
         fetched automatically using :meth:`~.Bot.application_info`.
         For performance reasons it is recommended to use a :class:`set`
-        for the collection. You cannot set both `owner_id` and `owner_ids`.
+        for the collection. You cannot set both ``owner_id`` and ``owner_ids``.
+
+        .. versionadded:: 1.3
     """
     pass
 

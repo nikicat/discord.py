@@ -3,7 +3,7 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2019 Rapptz
+Copyright (c) 2015-2020 Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -25,12 +25,12 @@ DEALINGS IN THE SOFTWARE.
 """
 
 from .asset import Asset
-from .utils import parse_time, snowflake_time
+from .utils import parse_time, snowflake_time, _get_as_snowflake
+from .object import Object
 from .mixins import Hashable
 from .enums import ChannelType, VerificationLevel, try_enum
-from collections import namedtuple
 
-class PartialInviteChannel(namedtuple('PartialInviteChannel', 'id name type')):
+class PartialInviteChannel:
     """Represents a "partial" invite channel.
 
     This model will be given when the user is not part of the
@@ -64,10 +64,18 @@ class PartialInviteChannel(namedtuple('PartialInviteChannel', 'id name type')):
         The partial channel's type.
     """
 
-    __slots__ = ()
+    __slots__ = ('id', 'name', 'type')
+
+    def __init__(self, **kwargs):
+        self.id = kwargs.pop('id')
+        self.name = kwargs.pop('name')
+        self.type = kwargs.pop('type')
 
     def __str__(self):
         return self.name
+
+    def __repr__(self):
+        return '<PartialInviteChannel id={0.id} name={0.name} type={0.type!r}>'.format(self)
 
     @property
     def mention(self):
@@ -154,9 +162,22 @@ class PartialInviteGuild:
         """:class:`Asset`: Returns the guild's icon asset."""
         return self.icon_url_as()
 
-    def icon_url_as(self, *, format='webp', size=1024):
-        """The same operation as :meth:`Guild.icon_url_as`."""
-        return Asset._from_guild_image(self._state, self.id, self.icon, 'icons', format=format, size=size)
+    def is_icon_animated(self):
+        """:class:`bool`: Returns ``True`` if the guild has an animated icon.
+
+        .. versionadded:: 1.4
+        """
+        return bool(self.icon and self.icon.startswith('a_'))
+
+    def icon_url_as(self, *, format=None, static_format='webp', size=1024):
+        """The same operation as :meth:`Guild.icon_url_as`.
+
+        Returns
+        --------
+        :class:`Asset`
+            The resulting CDN asset.
+        """
+        return Asset._from_guild_icon(self._state, self, format=format, static_format=static_format, size=size)
 
     @property
     def banner_url(self):
@@ -164,7 +185,13 @@ class PartialInviteGuild:
         return self.banner_url_as()
 
     def banner_url_as(self, *, format='webp', size=2048):
-        """The same operation as :meth:`Guild.banner_url_as`."""
+        """The same operation as :meth:`Guild.banner_url_as`.
+
+        Returns
+        --------
+        :class:`Asset`
+            The resulting CDN asset.
+        """
         return Asset._from_guild_image(self._state, self.id, self.banner, 'banners', format=format, size=size)
 
     @property
@@ -173,7 +200,13 @@ class PartialInviteGuild:
         return self.splash_url_as()
 
     def splash_url_as(self, *, format='webp', size=2048):
-        """The same operation as :meth:`Guild.splash_url_as`."""
+        """The same operation as :meth:`Guild.splash_url_as`.
+
+        Returns
+        --------
+        :class:`Asset`
+            The resulting CDN asset.
+        """
         return Asset._from_guild_image(self._state, self.id, self.splash, 'splashes', format=format, size=size)
 
 class Invite(Hashable):
@@ -228,8 +261,8 @@ class Invite(Hashable):
         How long the before the invite expires in seconds. A value of 0 indicates that it doesn't expire.
     code: :class:`str`
         The URL fragment used for the invite.
-    guild: Union[:class:`Guild`, :class:`PartialInviteGuild`]
-        The guild the invite is for.
+    guild: Optional[Union[:class:`Guild`, :class:`Object`, :class:`PartialInviteGuild`]]
+        The guild the invite is for. Can be ``None`` if it's from a group direct message.
     revoked: :class:`bool`
         Indicates if the invite has been revoked.
     created_at: :class:`datetime.datetime`
@@ -248,7 +281,7 @@ class Invite(Hashable):
     approximate_presence_count: Optional[:class:`int`]
         The approximate number of members currently active in the guild.
         This includes idle, dnd, online, and invisible members. Offline members are excluded.
-    channel: Union[:class:`abc.GuildChannel`, :class:`PartialInviteChannel`]
+    channel: Union[:class:`abc.GuildChannel`, :class:`Object`, :class:`PartialInviteChannel`]
         The channel the invite is for.
     """
 
@@ -277,17 +310,43 @@ class Invite(Hashable):
 
     @classmethod
     def from_incomplete(cls, *, state, data):
-        guild_id = int(data['guild']['id'])
-        channel_id = int(data['channel']['id'])
-        guild = state._get_guild(guild_id)
-        if guild is not None:
-            channel = guild.get_channel(channel_id)
+        try:
+            guild_id = int(data['guild']['id'])
+        except KeyError:
+            # If we're here, then this is a group DM
+            guild = None
         else:
-            channel_data = data['channel']
-            guild_data = data['guild']
-            channel_type = try_enum(ChannelType, channel_data['type'])
-            channel = PartialInviteChannel(id=channel_id, name=channel_data['name'], type=channel_type)
-            guild = PartialInviteGuild(state, guild_data, guild_id)
+            guild = state._get_guild(guild_id)
+            if guild is None:
+                # If it's not cached, then it has to be a partial guild
+                guild_data = data['guild']
+                guild = PartialInviteGuild(state, guild_data, guild_id)
+
+        # As far as I know, invites always need a channel
+        # So this should never raise.
+        channel_data = data['channel']
+        channel_id = int(channel_data['id'])
+        channel_type = try_enum(ChannelType, channel_data['type'])
+        channel = PartialInviteChannel(id=channel_id, name=channel_data['name'], type=channel_type)
+        if guild is not None and not isinstance(guild, PartialInviteGuild):
+            # Upgrade the partial data if applicable
+            channel = guild.get_channel(channel_id) or channel
+
+        data['guild'] = guild
+        data['channel'] = channel
+        return cls(state=state, data=data)
+
+    @classmethod
+    def from_gateway(cls, *, state, data):
+        guild_id = _get_as_snowflake(data, 'guild_id')
+        guild = state._get_guild(guild_id)
+        channel_id = _get_as_snowflake(data, 'channel_id')
+        if guild is not None:
+            channel = guild.get_channel(channel_id) or Object(id=channel_id)
+        else:
+            guild = Object(id=guild_id)
+            channel = Object(id=channel_id)
+
         data['guild'] = guild
         data['channel'] = channel
         return cls(state=state, data=data)

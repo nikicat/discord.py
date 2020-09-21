@@ -3,7 +3,7 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2017 Rapptz
+Copyright (c) 2015-2020 Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -27,6 +27,7 @@ DEALINGS IN THE SOFTWARE.
 from collections import namedtuple
 
 import discord.abc
+from .flags import PublicUserFlags
 from .utils import snowflake_time, _bytes_to_base64_data, parse_time
 from .enums import DefaultAvatar, RelationshipType, UserFlags, HypeSquadHouse, PremiumType, try_enum
 from .errors import ClientException
@@ -71,10 +72,18 @@ class Profile(namedtuple('Profile', 'flags user mutual_guilds connected_accounts
         flags = (UserFlags.hypesquad_bravery, UserFlags.hypesquad_brilliance, UserFlags.hypesquad_balance)
         return [house for house, flag in zip(HypeSquadHouse, flags) if self._has_flag(flag)]
 
+    @property
+    def team_user(self):
+        return self._has_flag(UserFlags.team_user)
+
+    @property
+    def system(self):
+        return self._has_flag(UserFlags.system)
+
 _BaseUser = discord.abc.User
 
 class BaseUser(_BaseUser):
-    __slots__ = ('name', 'id', 'discriminator', 'avatar', 'bot', '_state')
+    __slots__ = ('name', 'id', 'discriminator', 'avatar', 'bot', 'system', '_public_flags', '_state')
 
     def __init__(self, *, state, data):
         self._state = state
@@ -97,7 +106,9 @@ class BaseUser(_BaseUser):
         self.id = int(data['id'])
         self.discriminator = data['discriminator']
         self.avatar = data['avatar']
+        self._public_flags = data.get('public_flags', 0)
         self.bot = data.get('bot', False)
+        self.system = data.get('system', False)
 
     @classmethod
     def _copy(cls, user):
@@ -122,8 +133,13 @@ class BaseUser(_BaseUser):
         }
 
     @property
+    def public_flags(self):
+        """:class:`PublicUserFlags`: The publicly available flags the user has."""
+        return PublicUserFlags._from_value(self._public_flags)
+
+    @property
     def avatar_url(self):
-        """Returns an :class:`Asset` for the avatar the user has.
+        """:class:`Asset`: Returns an :class:`Asset` for the avatar the user has.
 
         If the user does not have a traditional avatar, an asset for
         the default avatar is returned instead.
@@ -188,7 +204,7 @@ class BaseUser(_BaseUser):
         """:class:`Colour`: A property that returns a colour denoting the rendered colour
         for the user. This always returns :meth:`Colour.default`.
 
-        There is an alias for this named :meth:`color`.
+        There is an alias for this named :attr:`color`.
         """
         return Colour.default()
 
@@ -197,7 +213,7 @@ class BaseUser(_BaseUser):
         """:class:`Colour`: A property that returns a color denoting the rendered color
         for the user. This always returns :meth:`Colour.default`.
 
-        There is an alias for this named :meth:`colour`.
+        There is an alias for this named :attr:`colour`.
         """
         return self.colour
 
@@ -287,9 +303,14 @@ class ClientUser(BaseUser):
     discriminator: :class:`str`
         The user's discriminator. This is given when the username has conflicts.
     avatar: Optional[:class:`str`]
-        The avatar hash the user has. Could be None.
+        The avatar hash the user has. Could be ``None``.
     bot: :class:`bool`
         Specifies if the user is a bot account.
+    system: :class:`bool`
+        Specifies if the user is a system user (i.e. represents Discord officially).
+
+        .. versionadded:: 1.3
+
     verified: :class:`bool`
         Specifies if the user is a verified account.
     email: Optional[:class:`str`]
@@ -658,6 +679,8 @@ class User(BaseUser, discord.abc.Messageable):
         The avatar hash the user has. Could be None.
     bot: :class:`bool`
         Specifies if the user is a bot account.
+    system: :class:`bool`
+        Specifies if the user is a system user (i.e. represents Discord officially).
     """
 
     __slots__ = BaseUser.__slots__ + ('__weakref__',)
@@ -694,7 +717,7 @@ class User(BaseUser, discord.abc.Messageable):
 
     @property
     def relationship(self):
-        """Returns the :class:`Relationship` with this user if applicable, ``None`` otherwise.
+        """Optional[:class:`Relationship`]: Returns the :class:`Relationship` with this user if applicable, ``None`` otherwise.
 
         .. note::
 
