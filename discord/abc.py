@@ -161,7 +161,7 @@ class PrivateChannel(metaclass=abc.ABCMeta):
             return NotImplemented
         return NotImplemented
 
-_Overwrites = namedtuple('_Overwrites', 'id allow deny type')
+_Overwrites = namedtuple('_Overwrites', 'id allow deny type deny_new allow_new')
 
 class GuildChannel:
     """An ABC that details the common operations on a Discord guild channel.
